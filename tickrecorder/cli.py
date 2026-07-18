@@ -2,26 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import signal
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 from tickrecorder.config import ConfigurationError, Settings
+from tickrecorder.logger import (
+    configure_logging as configure_application_logging,
+    create_logger,
+)
 from tickrecorder.recorder import FyersTickRecorder
 
 
-class RedactingFormatter(logging.Formatter):
-    def __init__(self, fmt: str, secrets: set[str]) -> None:
-        super().__init__(fmt)
-        self.secrets = sorted((secret for secret in secrets if secret), key=len, reverse=True)
-
-    def format(self, record: logging.LogRecord) -> str:
-        rendered = super().format(record)
-        for secret in self.secrets:
-            rendered = rendered.replace(secret, "<redacted>")
-        return rendered
+LOG = create_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,32 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def configure_logging(settings: Settings) -> None:
-    settings.log_dir.mkdir(parents=True, exist_ok=True)
-    level = getattr(logging, settings.log_level)
-    formatter = RedactingFormatter(
-        "%(asctime)s %(levelname)s %(name)s %(threadName)s %(message)s",
+def configure_logging(settings: Settings) -> Path:
+    return configure_application_logging(
+        settings.log_dir,
+        settings.log_level,
         {
             settings.ws_token,
             settings.ws_token.split(":", 1)[-1],
         },
     )
-    root = logging.getLogger()
-    root.setLevel(level)
-    root.handlers.clear()
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-    root.addHandler(console)
-
-    file_handler = logging.FileHandler(
-        settings.log_dir / "tickrecorder.log",
-        encoding="utf-8",
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
 
 
 def apply_cli_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
@@ -111,16 +88,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
 
-    configure_logging(settings)
+    log_path = configure_logging(settings)
+    LOG.info(
+        "Logging configured level=%s file=%s",
+        settings.log_level,
+        log_path,
+    )
+    LOG.info(
+        "Configuration loaded symbols=%d data_dir=%s sdk_log_dir=%s duration_seconds=%g",
+        len(settings.symbols),
+        settings.data_dir,
+        settings.sdk_log_dir,
+        settings.duration_seconds,
+    )
+    LOG.debug("Configured FYERS symbols=%s", settings.symbols)
     if args.validate_config:
+        LOG.info("Configuration validation completed successfully")
         print(json.dumps(settings.redacted_dict(), indent=2, sort_keys=True))
         return 0
 
     recorder = FyersTickRecorder(settings)
 
     def stop_handler(signum: int, _frame: object) -> None:
-        recorder.request_stop(signal.Signals(signum).name.lower())
+        signal_name = signal.Signals(signum).name.lower()
+        LOG.info("Received process signal signal=%s", signal_name)
+        recorder.request_stop(signal_name)
 
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
-    return recorder.run()
+    LOG.debug("Installed SIGINT and SIGTERM stop handlers")
+    exit_code = recorder.run()
+    LOG.info("Tick recorder exited code=%d", exit_code)
+    return exit_code

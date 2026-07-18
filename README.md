@@ -137,6 +137,15 @@ queue and force-flushes any remaining rows.
 | `TICKRECORDER_TIMEZONE` | `Asia/Kolkata` | Local timestamp and receipt-date partition timezone. |
 | `TICKRECORDER_DURATION_SECONDS` | `0` | Optional finite run duration. Zero means run until SIGINT or SIGTERM. |
 
+Application modules share one logger and emit action-oriented messages for startup,
+connections, subscriptions, readiness, Parquet publication, shutdown, and failures. Console
+output is colorized when attached to a terminal; the plain daily file is written as
+`logs/YYYY-MM-DD_tickrecorder.log` (or under `TICKRECORDER_LOG_DIR`). FYERS SDK logs remain
+separate under `TICKRECORDER_SDK_LOG_DIR`.
+
+Successful market-data callbacks are not logged one by one. The periodic `STATUS` message
+reports aggregate event counts and queue depth without adding per-tick I/O.
+
 ## Validate configuration
 
 This prints only redacted configuration and does not connect to FYERS:

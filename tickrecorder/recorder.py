@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.metadata
-import logging
 import os
 import platform
 import socket
@@ -17,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from tickrecorder import __version__
 from tickrecorder.config import Settings
+from tickrecorder.logger import create_logger
 from tickrecorder.normalizers import (
     normalize_control_event,
     normalize_depth,
@@ -26,7 +26,7 @@ from tickrecorder.schemas import SCHEMA_VERSION
 from tickrecorder.writer import EventEnvelope, ParquetEventWriter
 
 
-LOG = logging.getLogger("tickrecorder.recorder")
+LOG = create_logger(__name__)
 
 
 class FyersTickRecorder:
@@ -114,7 +114,11 @@ class FyersTickRecorder:
                 self.stop_reason = reason
                 first_failure = True
         if first_failure:
-            LOG.error("Fatal recorder condition reason=%s error=%s", reason, type(exc).__name__)
+            LOG.error(
+                "Fatal recorder condition reason=%s error=%s",
+                reason,
+                type(exc).__name__,
+            )
         self.stop_event.set()
 
     def _mark_degraded(self, reason: str) -> None:
@@ -222,13 +226,31 @@ class FyersTickRecorder:
             symbol,
             self.settings.tbt_channel if component == "tbt" else None,
         )
+        redacted_message = self._redact_text(message) if message is not None else None
+        redacted_details = self._redact_value(details)
+        log_method = getattr(LOG, severity.lower(), LOG.info)
+        if redacted_message is None:
+            log_method(
+                "Action component=%s event=%s symbol=%s",
+                component,
+                event_type,
+                symbol or "-",
+            )
+        else:
+            log_method(
+                "Action component=%s event=%s symbol=%s message=%s",
+                component,
+                event_type,
+                symbol or "-",
+                redacted_message,
+            )
         row = normalize_control_event(
             common=common,
             component=component,
             event_type=event_type,
             severity=severity,
-            message=self._redact_text(message) if message is not None else None,
-            details=self._redact_value(details),
+            message=redacted_message,
+            details=redacted_details,
         )
         self._submit("control", row)
 
@@ -236,11 +258,18 @@ class FyersTickRecorder:
         with self._state_lock:
             previous_epoch = self._connection_epochs[component]
             self._connection_epochs[component] += 1
+            connection_epoch = self._connection_epochs[component]
             self._connection_ids[component] = str(uuid.uuid4())
             if component == "tbt":
                 self._tbt_symbols_seen_in_epoch.clear()
             if component in self._disconnected_since:
                 self._disconnected_since[component] = None
+        LOG.info(
+            "Connection opened component=%s epoch=%d reconnect=%s",
+            component,
+            connection_epoch,
+            previous_epoch > 0,
+        )
         if component in {"data", "tbt"} and previous_epoch > 0:
             self._mark_degraded(f"{component}_reconnected")
 
@@ -258,6 +287,10 @@ class FyersTickRecorder:
         self.data_ws_module = data_ws
         self.FyersTbtSocket = FyersTbtSocket
         self.SubscriptionModes = SubscriptionModes
+        LOG.info(
+            "FYERS SDK loaded version=%s",
+            self._package_version("fyers-apiv3") or "unknown",
+        )
 
     @staticmethod
     def _sdk_websocket(socket_object: Any) -> Any:
@@ -363,7 +396,6 @@ class FyersTickRecorder:
 
     def on_data_error(self, message: Any) -> None:
         redacted_message = self._redact_text(message)
-        LOG.error("FYERS data socket error: %s", redacted_message)
         if not self.stop_event.is_set():
             self._mark_degraded("data_socket_error")
         self._safe_control(
@@ -386,14 +418,14 @@ class FyersTickRecorder:
 
     def on_data_close(self, message: Any) -> None:
         redacted_message = self._redact_text(message)
-        LOG.warning("FYERS data socket closed: %s", redacted_message)
-        if not self.stop_event.is_set():
+        expected_shutdown = self.stop_event.is_set()
+        if not expected_shutdown:
             self._mark_degraded("data_socket_closed")
         self._safe_control(
             "data",
             "socket_close",
             {"payload": redacted_message},
-            severity="WARNING",
+            severity="INFO" if expected_shutdown else "WARNING",
             message=redacted_message,
         )
 
@@ -401,7 +433,6 @@ class FyersTickRecorder:
         if not self._wait_until_connected("data", self.data_socket):
             return
         self._new_connection("data")
-        LOG.info("FYERS data socket opened; subscribing SymbolUpdate for %s", self.settings.symbols)
         self._safe_control(
             "data",
             "socket_open",
@@ -511,7 +542,6 @@ class FyersTickRecorder:
 
     def on_tbt_server_error(self, message: Any) -> None:
         redacted_message = self._redact_text(message)
-        LOG.error("FYERS TBT server error: %s", redacted_message)
         if not self.stop_event.is_set():
             self._mark_degraded("tbt_server_error")
         self._safe_control(
@@ -531,7 +561,6 @@ class FyersTickRecorder:
 
     def on_tbt_error(self, message: Any) -> None:
         redacted_message = self._redact_text(message)
-        LOG.error("FYERS TBT socket error: %s", redacted_message)
         if not self.stop_event.is_set():
             self._mark_degraded("tbt_socket_error")
         self._safe_control(
@@ -544,14 +573,14 @@ class FyersTickRecorder:
 
     def on_tbt_close(self, message: Any) -> None:
         redacted_message = self._redact_text(message)
-        LOG.warning("FYERS TBT socket closed: %s", redacted_message)
-        if not self.stop_event.is_set():
+        expected_shutdown = self.stop_event.is_set()
+        if not expected_shutdown:
             self._mark_degraded("tbt_socket_closed")
         self._safe_control(
             "tbt",
             "socket_close",
             {"payload": redacted_message},
-            severity="WARNING",
+            severity="INFO" if expected_shutdown else "WARNING",
             message=redacted_message,
         )
 
@@ -559,11 +588,6 @@ class FyersTickRecorder:
         if self.stop_event.is_set():
             return
         self._new_connection("tbt")
-        LOG.info(
-            "FYERS TBT opened; SDK will activate channel=%s symbols=%s",
-            self.settings.tbt_channel,
-            self.settings.symbols,
-        )
         self._safe_control(
             "tbt",
             "socket_open",
@@ -884,6 +908,12 @@ class FyersTickRecorder:
         return True
 
     def start(self) -> None:
+        LOG.info(
+            "Starting recorder run=%s symbols=%d data_dir=%s",
+            self.run_id,
+            len(self.settings.symbols),
+            self.settings.data_dir,
+        )
         self._prepare_directories()
         self._load_sdk()
         self.writer.start()
@@ -913,6 +943,10 @@ class FyersTickRecorder:
         self._threads = [data_thread, tbt_thread]
         for thread in self._threads:
             thread.start()
+        LOG.info(
+            "Connector threads started names=%s",
+            [thread.name for thread in self._threads],
+        )
 
     def run(self) -> int:
         exit_code = 0
@@ -1001,6 +1035,10 @@ class FyersTickRecorder:
                 condition.notify_all()
 
     def _shutdown_sockets(self) -> None:
+        LOG.info(
+            "Stopping FYERS sockets timeout_seconds=%g",
+            self.settings.shutdown_timeout_seconds,
+        )
         deadline = time.monotonic() + self.settings.shutdown_timeout_seconds
         socket_items = [
             ("tbt", self.tbt_socket),
@@ -1112,10 +1150,17 @@ class FyersTickRecorder:
                     self._set_fatal(exc, "callback_shutdown_timeout")
                     raise exc
                 self._submission_condition.wait(timeout=remaining)
+        LOG.debug("Callback submissions drained")
 
     def stop(self) -> None:
         if self._ended_at_ns is not None:
+            LOG.debug("Recorder stop ignored because shutdown already completed")
             return
+        LOG.info(
+            "Stopping recorder run=%s reason=%s",
+            self.run_id,
+            self.stop_reason,
+        )
         self.stop_event.set()
         self._safe_control(
             "process",
@@ -1174,6 +1219,7 @@ class FyersTickRecorder:
             probe = path / f".tickrecorder-write-test-{uuid.uuid4().hex}"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
+            LOG.debug("Verified writable directory path=%s", path)
 
     def _log_status_if_due(self) -> None:
         now = time.monotonic()
@@ -1243,10 +1289,11 @@ class FyersTickRecorder:
         }
 
     def _write_manifest(self, status: str) -> None:
-        self.writer.write_json_atomic(
+        path = self.writer.write_json_atomic(
             "manifest.json",
             self._manifest_payload(status),
         )
+        LOG.info("Wrote run manifest status=%s path=%s", status, path)
 
     @staticmethod
     def _package_version(package: str) -> str | None:

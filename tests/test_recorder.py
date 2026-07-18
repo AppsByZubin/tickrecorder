@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import replace
@@ -161,7 +162,13 @@ def test_recorder_writes_complete_three_stream_run(
 
     run_root = recorder.writer.run_root
     assert (run_root / "_SUCCESS").exists()
-    date_root = tmp_path / "data" / "20260717"
+    date_roots = [
+        path
+        for path in (tmp_path / "data").iterdir()
+        if path.is_dir() and path.name.isdigit()
+    ]
+    assert len(date_roots) == 1
+    date_root = date_roots[0]
     assert len(list((date_root / "symbolupdate").glob("*.parquet"))) == 1
     assert len(list((date_root / "tbtdepth").glob("*.parquet"))) == 1
     assert len(list((date_root / "control").glob("*.parquet"))) >= 1
@@ -185,6 +192,33 @@ def test_first_fatal_reason_is_preserved(
 
     assert recorder._fatal_error is first
     assert recorder.stop_reason == "first_reason"
+
+
+def test_control_action_is_logged_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    submitted: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        recorder,
+        "_submit",
+        lambda source, row: submitted.append((source, row)),
+    )
+    caplog.set_level(logging.INFO, logger="tickrecorder.recorder")
+
+    recorder._control(
+        "data",
+        "socket_open",
+        {"token": "APP-100:test-secret"},
+        message="connected with APP-100:test-secret",
+    )
+
+    assert "Action component=data event=socket_open" in caplog.text
+    assert "connected with <redacted>" in caplog.text
+    assert "test-secret" not in caplog.text
+    assert "test-secret" not in json.dumps(submitted, default=str)
 
 
 def test_stalled_valid_callback_stream_is_fatal(

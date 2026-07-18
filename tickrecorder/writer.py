@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 import queue
 import threading
@@ -16,10 +15,11 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tickrecorder.logger import create_logger
 from tickrecorder.schemas import SCHEMAS
 
 
-LOG = logging.getLogger("tickrecorder.writer")
+LOG = create_logger(__name__)
 _STOP = object()
 STREAM_DIRECTORIES = {
     "control": "control",
@@ -58,6 +58,7 @@ class ParquetEventWriter:
         self.run_root = self.metadata_root
         self.flush_interval_seconds = flush_interval_seconds
         self.max_rows_per_file = max_rows_per_file
+        self.queue_max_events = queue_max_events
         self.queue_put_timeout_seconds = queue_put_timeout_seconds
         self.compression = None if compression == "none" else compression
 
@@ -82,10 +83,16 @@ class ParquetEventWriter:
 
     def start(self) -> None:
         if self._started:
+            LOG.debug("Parquet writer start ignored run=%s", self.run_id)
             return
         self.metadata_root.mkdir(parents=True, exist_ok=False)
         self._started = True
         self._thread.start()
+        LOG.info(
+            "Parquet writer started run=%s metadata_dir=%s",
+            self.run_id,
+            self.metadata_root,
+        )
 
     def submit(self, event: EventEnvelope) -> None:
         self.raise_if_failed()
@@ -94,6 +101,12 @@ class ParquetEventWriter:
         try:
             self._queue.put(event, timeout=self.queue_put_timeout_seconds)
         except queue.Full as exc:
+            LOG.error(
+                "Parquet writer queue full size=%d capacity=%d timeout_seconds=%g",
+                self._queue.qsize(),
+                self.queue_max_events,
+                self.queue_put_timeout_seconds,
+            )
             raise RecorderBackpressureError(
                 "Recorder queue is full; terminating rather than silently dropping data"
             ) from exc
@@ -109,8 +122,19 @@ class ParquetEventWriter:
 
     def stop(self, timeout_seconds: float | None = None) -> None:
         if not self._started or self._stopped:
+            LOG.debug(
+                "Parquet writer stop ignored run=%s started=%s stopped=%s",
+                self.run_id,
+                self._started,
+                self._stopped,
+            )
             self.raise_if_failed()
             return
+        LOG.info(
+            "Stopping Parquet writer run=%s queued=%d",
+            self.run_id,
+            self._queue.qsize(),
+        )
         self._stopped = True
         deadline = (
             time.monotonic() + timeout_seconds
@@ -138,6 +162,13 @@ class ParquetEventWriter:
         if self._thread.is_alive():
             raise TimeoutError("Timed out waiting for the Parquet writer to stop")
         self.raise_if_failed()
+        stats = self.stats()
+        LOG.info(
+            "Parquet writer stopped run=%s rows=%d files=%d",
+            self.run_id,
+            sum(stats["rows_written"].values()),
+            sum(stats["files_written"].values()),
+        )
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
@@ -168,6 +199,7 @@ class ParquetEventWriter:
                     item = None
 
                 if item is _STOP:
+                    LOG.debug("Parquet writer received stop signal run=%s", self.run_id)
                     self._flush_all()
                     return
                 if isinstance(item, EventEnvelope):
@@ -184,6 +216,14 @@ class ParquetEventWriter:
             self._set_failure(exc)
 
     def _flush_all(self) -> None:
+        buffered_rows = sum(len(rows) for rows in self._buffers.values())
+        if buffered_rows:
+            LOG.debug(
+                "Flushing Parquet buffers run=%s rows=%d streams=%d",
+                self.run_id,
+                buffered_rows,
+                sum(bool(rows) for rows in self._buffers.values()),
+            )
         for key in list(self._buffers):
             self._flush_key(key)
         self._last_flush = time.monotonic()
@@ -270,6 +310,7 @@ class ParquetEventWriter:
                 temporary_path.unlink()
                 return final_path
             except FileExistsError:
+                LOG.warning("Parquet part name collision path=%s", final_path)
                 final_path = requested_path.with_name(
                     f"{requested_path.stem}-{uuid.uuid4().hex[:8]}"
                     f"{requested_path.suffix}"
@@ -310,6 +351,7 @@ class ParquetEventWriter:
             os.fsync(handle.fileno())
         os.replace(temporary_path, final_path)
         self._fsync_directory(self.metadata_root)
+        LOG.info("Wrote run metadata path=%s", final_path)
         return final_path
 
     def write_marker_atomic(self, filename: str) -> Path:
@@ -321,4 +363,5 @@ class ParquetEventWriter:
             os.fsync(handle.fileno())
         os.replace(temporary_path, final_path)
         self._fsync_directory(self.metadata_root)
+        LOG.info("Wrote run marker path=%s", final_path)
         return final_path
