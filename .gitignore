@@ -1,0 +1,16 @@
+.env
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+build/
+dist/
+data/
+logs/
+*.inprogress
+.log
+fyersApi.log
+fyersRequests.log

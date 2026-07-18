@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tickrecorder"
+version = "0.1.0"
+description = "Loss-evident FYERS SymbolUpdate and 50-level TBT Parquet recorder"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fyers-apiv3==3.1.14",
+    "protobuf>=5.26.1,<6",
+    "pyarrow>=18,<24",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+tickrecorder = "tickrecorder.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tickrecorder*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
