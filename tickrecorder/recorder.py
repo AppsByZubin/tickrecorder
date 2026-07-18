@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.metadata
 import os
 import platform
@@ -10,7 +11,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, time as wall_time, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -23,10 +24,20 @@ from tickrecorder.normalizers import (
     normalize_symbol_update,
 )
 from tickrecorder.schemas import SCHEMA_VERSION
+from tickrecorder.spaces import (
+    DigitalOceanSpacesConfig,
+    create_trade_ticks_archive,
+    finalized_trading_dates,
+    pending_trading_dates,
+    upload_trade_ticks_archive,
+    write_upload_receipt_atomic,
+)
 from tickrecorder.writer import EventEnvelope, ParquetEventWriter
 
 
 LOG = create_logger(__name__)
+MARKET_OPEN_TIME = wall_time(9, 15)
+MARKET_CLOSE_TIME = wall_time(15, 31)
 
 
 class FyersTickRecorder:
@@ -34,6 +45,7 @@ class FyersTickRecorder:
         self.settings = settings
         self.run_id = str(uuid.uuid4())
         self.local_timezone = ZoneInfo(settings.timezone)
+        self.market_timezone = ZoneInfo("Asia/Kolkata")
         self.stop_event = threading.Event()
         self.stop_reason = "not_stopped"
 
@@ -94,6 +106,10 @@ class FyersTickRecorder:
         self._clean_shutdown = False
         self._final_status: str | None = None
         self._fatal_error: BaseException | None = None
+        self._trade_tick_archives: list[dict[str, Any]] = []
+        self._spaces_client: Any = None
+        self._data_lock_handle: Any = None
+        self._market_close_thread: threading.Thread | None = None
         self._last_status_at = 0.0
         self._started = False
         self._configured_symbols_upper = {
@@ -133,6 +149,9 @@ class FyersTickRecorder:
         secrets = {
             self.settings.ws_token,
             self.settings.ws_token.split(":", 1)[-1],
+            self.settings.app_id,
+            self.settings.do_s3_access_key_id,
+            self.settings.do_s3_secret_access_key,
         }
         for secret in sorted((item for item in secrets if item), key=len, reverse=True):
             rendered = rendered.replace(secret, "<redacted>")
@@ -914,7 +933,8 @@ class FyersTickRecorder:
             len(self.settings.symbols),
             self.settings.data_dir,
         )
-        self._prepare_directories()
+        if self._data_lock_handle is None:
+            self._prepare_directories()
         self._load_sdk()
         self.writer.start()
         self._started = True
@@ -951,7 +971,17 @@ class FyersTickRecorder:
     def run(self) -> int:
         exit_code = 0
         try:
+            market_close_at: datetime | None = None
+            if self.settings.duration_seconds <= 0:
+                # Match taperecorder: a Job may be launched before market open,
+                # while the application owns the trading-session clock.
+                self._prepare_directories()
+                market_close_at = self._wait_for_market_open()
+                if market_close_at is None:
+                    return 0
             self.start()
+            if market_close_at is not None:
+                self._start_market_close_watcher(market_close_at)
             if self._wait_for_initial_readiness():
                 deadline = (
                     time.monotonic() + self.settings.duration_seconds
@@ -983,7 +1013,107 @@ class FyersTickRecorder:
                     exit_code = 1
                 if self._final_status != "complete":
                     exit_code = 1
+            self._release_data_directory_lock_if_safe()
+            self._join_market_close_watcher()
         return exit_code
+
+    def _now_market(self) -> datetime:
+        return datetime.now(self.market_timezone)
+
+    def _market_window(self, now: datetime) -> tuple[datetime, datetime]:
+        market_open = datetime.combine(
+            now.date(),
+            MARKET_OPEN_TIME,
+            tzinfo=self.market_timezone,
+        )
+        market_close = datetime.combine(
+            now.date(),
+            MARKET_CLOSE_TIME,
+            tzinfo=self.market_timezone,
+        )
+        return market_open, market_close
+
+    def _wait_for_market_open(self) -> datetime | None:
+        """Wait interruptibly until 09:15 IST and return today's 15:31 close."""
+
+        now = self._now_market()
+        if now.weekday() >= 5:
+            self.stop_reason = "weekend"
+            LOG.warning(
+                "Recorder Job will not connect because today is a weekend date=%s",
+                now.date(),
+            )
+            return None
+
+        market_open, market_close = self._market_window(now)
+        if now >= market_close:
+            self.stop_reason = "market_window_closed"
+            LOG.warning(
+                "Recorder Job started after market close; exiting without connecting "
+                "now=%s market_close=%s",
+                now.isoformat(),
+                market_close.isoformat(),
+            )
+            return None
+
+        if now < market_open:
+            LOG.info(
+                "Waiting for market open now=%s market_open=%s seconds=%d",
+                now.isoformat(),
+                market_open.isoformat(),
+                int((market_open - now).total_seconds()),
+            )
+        while now < market_open and not self.stop_event.is_set():
+            remaining = max(0.0, (market_open - now).total_seconds())
+            self.stop_event.wait(min(remaining, 30.0))
+            now = self._now_market()
+        if self.stop_event.is_set():
+            LOG.info("Market-open wait interrupted reason=%s", self.stop_reason)
+            return None
+
+        LOG.info(
+            "Market open reached; starting FYERS connections market_open=%s "
+            "market_close=%s",
+            market_open.isoformat(),
+            market_close.isoformat(),
+        )
+        return market_close
+
+    def _start_market_close_watcher(self, market_close_at: datetime) -> None:
+        if self._market_close_thread is not None:
+            return
+
+        def watch_market_close() -> None:
+            LOG.info(
+                "Market-close watcher started disconnect_at=%s",
+                market_close_at.isoformat(),
+            )
+            while not self.stop_event.is_set():
+                remaining = (market_close_at - self._now_market()).total_seconds()
+                if remaining <= 0:
+                    LOG.info(
+                        "Market close reached; requesting websocket disconnect "
+                        "market_close=%s",
+                        market_close_at.isoformat(),
+                    )
+                    self.request_stop("market_close")
+                    return
+                self.stop_event.wait(min(remaining, 30.0))
+
+        self._market_close_thread = threading.Thread(
+            target=watch_market_close,
+            name="market-close-watcher",
+            daemon=True,
+        )
+        self._market_close_thread.start()
+
+    def _join_market_close_watcher(self) -> None:
+        thread = self._market_close_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            LOG.warning("Market-close watcher did not stop within one second")
 
     def request_stop(self, reason: str) -> None:
         if not self.stop_event.is_set():
@@ -1152,9 +1282,116 @@ class FyersTickRecorder:
                 self._submission_condition.wait(timeout=remaining)
         LOG.debug("Callback submissions drained")
 
+    def _archive_and_upload_trade_ticks(self) -> None:
+        writer_stats = self.writer.stats()
+        current_dates = (
+            finalized_trading_dates(writer_stats["parts"])
+            if writer_stats["parts"]
+            else ()
+        )
+        trading_dates = tuple(
+            sorted(
+                set(current_dates)
+                | set(
+                    pending_trading_dates(
+                        self.settings.data_dir,
+                        self.settings.do_s3_bucket_name,
+                        self.settings.do_s3_spaces_prefix,
+                    )
+                )
+            )
+        )
+        spaces = DigitalOceanSpacesConfig(
+            endpoint_url=self.settings.do_s3_endpoint_url,
+            region=self.settings.do_s3_region,
+            bucket_name=self.settings.do_s3_bucket_name,
+            prefix=self.settings.do_s3_spaces_prefix,
+            access_key_id=self.settings.do_s3_access_key_id,
+            secret_access_key=self.settings.do_s3_secret_access_key,
+        )
+        LOG.info("Archiving finalized trade-tick dates dates=%s", trading_dates)
+        failures: list[tuple[str, BaseException]] = []
+        for trading_date in trading_dates:
+            archive_record: dict[str, Any] = {
+                "trading_date": trading_date,
+                "archive_path": None,
+                "source_dir": str(self.settings.data_dir / trading_date),
+                "file_count": None,
+                "size_bytes": None,
+                "sha256": None,
+                "source_fingerprint": None,
+                "upload_status": "archiving",
+                "bucket_name": spaces.bucket_name,
+                "object_key": None,
+                "uri": None,
+                "etag": None,
+            }
+            self._trade_tick_archives.append(archive_record)
+            try:
+                artifact = create_trade_ticks_archive(
+                    self.settings.data_dir,
+                    trading_date,
+                )
+            except BaseException as exc:
+                archive_record["upload_status"] = "archive_failed"
+                archive_record["error"] = self._redact_text(repr(exc))
+                failures.append((trading_date, exc))
+                LOG.exception(
+                    "Trade-ticks archive creation failed date=%s",
+                    trading_date,
+                )
+                continue
+
+            archive_record.update(
+                {
+                    "archive_path": str(artifact.archive_path),
+                    "file_count": artifact.file_count,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    "source_fingerprint": artifact.source_fingerprint,
+                    "upload_status": "uploading",
+                }
+            )
+            try:
+                receipt = upload_trade_ticks_archive(
+                    artifact,
+                    spaces,
+                    client=self._spaces_client,
+                )
+                archive_record.update(
+                    {
+                        "upload_status": "verified",
+                        "object_key": receipt.object_key,
+                        "uri": receipt.uri,
+                        "remote_sha256": receipt.sha256,
+                        "etag": receipt.etag,
+                    }
+                )
+                receipt_path = write_upload_receipt_atomic(
+                    self.settings.data_dir,
+                    trading_date,
+                    archive_record,
+                )
+                archive_record["receipt_path"] = str(receipt_path)
+            except BaseException as exc:
+                archive_record["upload_status"] = "failed"
+                archive_record["error"] = self._redact_text(repr(exc))
+                failures.append((trading_date, exc))
+                LOG.exception(
+                    "Trade-ticks upload or receipt failed date=%s",
+                    trading_date,
+                )
+
+        if failures:
+            failed_dates = ", ".join(date for date, _exc in failures)
+            raise RuntimeError(
+                f"Archive/upload failed for trading dates: {failed_dates}"
+            ) from failures[0][1]
+
     def stop(self) -> None:
         if self._ended_at_ns is not None:
             LOG.debug("Recorder stop ignored because shutdown already completed")
+            self._release_data_directory_lock_if_safe()
             return
         LOG.info(
             "Stopping recorder run=%s reason=%s",
@@ -1189,7 +1426,21 @@ class FyersTickRecorder:
         if writer_error is not None and self.writer.is_alive():
             self._clean_shutdown = False
             self._final_status = "failed"
+            self._release_data_directory_lock_if_safe()
             raise writer_error
+        archive_error: BaseException | None = None
+        finalized_parts = self.writer.stats()["parts"]
+        if finalized_parts or pending_trading_dates(
+            self.settings.data_dir,
+            self.settings.do_s3_bucket_name,
+            self.settings.do_s3_spaces_prefix,
+        ):
+            try:
+                self._archive_and_upload_trade_ticks()
+            except BaseException as exc:
+                archive_error = exc
+                self._set_fatal(exc, "archive_upload_failure")
+                LOG.exception("Trade-ticks archive or upload failed")
         self._clean_shutdown = self._fatal_error is None
         with self._quality_lock:
             degraded = bool(self._degraded_reasons)
@@ -1206,8 +1457,11 @@ class FyersTickRecorder:
         self._write_manifest(status=status)
         self.writer.write_marker_atomic(marker_name)
         LOG.info("Recorder stopped status=%s run=%s", status, self.run_id)
+        self._release_data_directory_lock_if_safe()
         if writer_error is not None:
             raise writer_error
+        if archive_error is not None:
+            raise archive_error
 
     def _prepare_directories(self) -> None:
         for path in (
@@ -1220,6 +1474,47 @@ class FyersTickRecorder:
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
             LOG.debug("Verified writable directory path=%s", path)
+        self._acquire_data_directory_lock()
+
+    def _acquire_data_directory_lock(self) -> None:
+        if self._data_lock_handle is not None:
+            return
+        lock_path = self.settings.data_dir / ".tickrecorder.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise RuntimeError(
+                "Another tickrecorder process is already using data directory "
+                f"{self.settings.data_dir}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} run_id={self.run_id}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        self._data_lock_handle = handle
+        LOG.info("Acquired recorder data lock path=%s", lock_path)
+
+    def _release_data_directory_lock(self) -> None:
+        handle = self._data_lock_handle
+        if handle is None:
+            return
+        self._data_lock_handle = None
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        LOG.info("Released recorder data lock path=%s", handle.name)
+
+    def _release_data_directory_lock_if_safe(self) -> None:
+        if self.writer.is_alive():
+            LOG.error(
+                "Retaining recorder data lock because the Parquet writer is still alive"
+            )
+            return
+        self._release_data_directory_lock()
 
     def _log_status_if_due(self) -> None:
         now = time.monotonic()
@@ -1281,6 +1576,7 @@ class FyersTickRecorder:
             "configuration": self.settings.redacted_dict(),
             "received_events": received_stats,
             "writer": self.writer.stats(),
+            "trade_tick_archives": list(self._trade_tick_archives),
             "fatal_error": (
                 self._redact_text(repr(self._fatal_error))
                 if self._fatal_error

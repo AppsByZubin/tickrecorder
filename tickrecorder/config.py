@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
+
+from tickrecorder.spaces import (
+    DEFAULT_BUCKET_NAME,
+    DEFAULT_SPACES_PREFIX,
+    normalize_do_spaces_endpoint_url,
+    normalize_s3_key,
+)
 
 
 SUPPORTED_COMPRESSIONS = {"brotli", "gzip", "lz4", "none", "snappy", "zstd"}
@@ -100,34 +107,34 @@ def parse_symbols(raw: str) -> tuple[str, ...]:
 
 
 def build_ws_token() -> tuple[str, str]:
-    combined = os.getenv("FYERS_WS_TOKEN", "").strip()
-    if combined:
-        if ":" not in combined:
-            raise ConfigurationError(
-                "FYERS_WS_TOKEN must use the APP_ID:ACCESS_TOKEN format"
-            )
-        return combined, combined.split(":", 1)[0]
-
     app_id = os.getenv("FYERS_APP_ID", "").strip()
     access_token = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
+    if not app_id or not access_token:
+        raise ConfigurationError("Set both FYERS_APP_ID and FYERS_ACCESS_TOKEN")
     if access_token and ":" in access_token:
         token_app_id = access_token.split(":", 1)[0]
-        return access_token, app_id or token_app_id
-    if not app_id or not access_token:
-        raise ConfigurationError(
-            "Set FYERS_WS_TOKEN, or set both FYERS_APP_ID and FYERS_ACCESS_TOKEN"
-        )
+        if token_app_id != app_id:
+            raise ConfigurationError(
+                "FYERS_ACCESS_TOKEN contains an app ID that does not match FYERS_APP_ID"
+            )
+        return access_token, app_id
     return f"{app_id}:{access_token}", app_id
 
 
 @dataclass(frozen=True)
 class Settings:
-    ws_token: str
-    app_id: str
+    ws_token: str = field(repr=False)
+    app_id: str = field(repr=False)
     symbols: tuple[str, ...]
     data_dir: Path
     log_dir: Path
     sdk_log_dir: Path
+    do_s3_endpoint_url: str
+    do_s3_region: str
+    do_s3_bucket_name: str
+    do_s3_spaces_prefix: str
+    do_s3_access_key_id: str = field(repr=False)
+    do_s3_secret_access_key: str = field(repr=False)
     tbt_channel: str
     data_reconnect: bool
     data_reconnect_retries: int
@@ -185,6 +192,39 @@ class Settings:
                 path = runtime_root / path
             return path.resolve()
 
+        do_s3_region = os.getenv("DO_S3_REGION", "").strip()
+        do_s3_bucket_name = (
+            os.getenv("DO_S3_BUCKET_NAME", "").strip() or DEFAULT_BUCKET_NAME
+        )
+        do_s3_endpoint_url = normalize_do_spaces_endpoint_url(
+            os.getenv("DO_S3_ENDPOINT_URL", "").strip(),
+            do_s3_region,
+            do_s3_bucket_name,
+        )
+        do_s3_spaces_prefix = normalize_s3_key(
+            do_s3_bucket_name,
+            os.getenv("DO_S3_SPACES_PREFIX", "").strip()
+            or DEFAULT_SPACES_PREFIX,
+        ).strip("/")
+        do_s3_access_key_id = os.getenv("DO_S3_ACCESS_KEY_ID", "").strip()
+        do_s3_secret_access_key = os.getenv(
+            "DO_S3_SECRET_ACCESS_KEY", ""
+        ).strip()
+        required_spaces_values = {
+            "DO_S3_ENDPOINT_URL": do_s3_endpoint_url,
+            "DO_S3_REGION": do_s3_region,
+            "DO_S3_ACCESS_KEY_ID": do_s3_access_key_id,
+            "DO_S3_SECRET_ACCESS_KEY": do_s3_secret_access_key,
+        }
+        missing_spaces_values = [
+            name for name, value in required_spaces_values.items() if not value
+        ]
+        if missing_spaces_values:
+            raise ConfigurationError(
+                "Set required DigitalOcean Spaces variables: "
+                + ", ".join(missing_spaces_values)
+            )
+
         channel = os.getenv("FYERS_TBT_CHANNEL", "1").strip()
         try:
             channel_number = int(channel)
@@ -222,6 +262,12 @@ class Settings:
             data_dir=resolved_path(raw_data_dir),
             log_dir=resolved_path(raw_log_dir),
             sdk_log_dir=resolved_path(raw_sdk_log_dir),
+            do_s3_endpoint_url=do_s3_endpoint_url,
+            do_s3_region=do_s3_region,
+            do_s3_bucket_name=do_s3_bucket_name,
+            do_s3_spaces_prefix=do_s3_spaces_prefix,
+            do_s3_access_key_id=do_s3_access_key_id,
+            do_s3_secret_access_key=do_s3_secret_access_key,
             tbt_channel=str(channel_number),
             data_reconnect=_env_bool("TICKRECORDER_DATA_RECONNECT", True),
             data_reconnect_retries=_env_int(
@@ -304,6 +350,9 @@ class Settings:
     def redacted_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["ws_token"] = "<redacted>"
+        result["app_id"] = "<redacted>"
+        result["do_s3_access_key_id"] = "<redacted>"
+        result["do_s3_secret_access_key"] = "<redacted>"
         result["symbols"] = list(self.symbols)
         for key in ("data_dir", "log_dir", "sdk_log_dir"):
             result[key] = str(result[key])

@@ -32,6 +32,7 @@ tickrecorder/
 │   ├── normalizers.py
 │   ├── recorder.py
 │   ├── schemas.py
+│   ├── spaces.py
 │   └── writer.py
 ├── tests/
 ├── .env.example
@@ -71,16 +72,41 @@ resolved from the current working directory.
 
 ## Required environment variables
 
-Use either the combined WebSocket token or the separate app ID and access token.
-
 | Variable | Required | Description |
 |---|---:|---|
-| `FYERS_WS_TOKEN` | Conditional | Combined `APP_ID:ACCESS_TOKEN`. Takes precedence over separate credentials. |
-| `FYERS_APP_ID` | Conditional | FYERS application ID, normally ending in `-100`. |
-| `FYERS_ACCESS_TOKEN` | Conditional | FYERS access token. It normally needs to be refreshed each trading day. |
+| `FYERS_APP_ID` | Yes | FYERS application ID, normally ending in `-100`. |
+| `FYERS_ACCESS_TOKEN` | Yes | FYERS access token. It normally needs to be refreshed each trading day. |
 | `FYERS_SYMBOLS` | Yes | Exact FYERS symbols, comma-separated or a JSON list. Example: `NSE:NIFTY26JULFUT`. |
 
 `FYERS_SYMBOL` is accepted as a backwards-compatible single-symbol fallback, but `FYERS_SYMBOLS` is preferred.
+
+### DigitalOcean Spaces
+
+Every safely finalized date partition is archived and uploaded during recorder shutdown.
+
+| Variable | Required | Default |
+|---|---:|---|
+| `DO_S3_ENDPOINT_URL` | Yes | — |
+| `DO_S3_REGION` | Yes | — |
+| `DO_S3_ACCESS_KEY_ID` | Yes | — |
+| `DO_S3_SECRET_ACCESS_KEY` | Yes | — |
+| `DO_S3_BUCKET_NAME` | No | `index-bucket` |
+| `DO_S3_SPACES_PREFIX` | No | `index-bucket-holder/contracts` |
+
+For a `20260717` partition, the local archive and verified destination are:
+
+```text
+data/20260717_trade_ticks.tar.gz
+s3://index-bucket/index-bucket-holder/contracts/20260717/20260717_trade_ticks.tar.gz
+```
+
+The archive retains `20260717/` as its top-level directory. Upload completion is verified
+against the remote object size and by reading the stored object back and hashing its bytes
+with SHA-256 before the run can receive a success or degraded marker. Each receipt is also
+bound to the source-directory inventory and exact bucket/key, so later same-date parts or a
+destination change invalidate the old receipt. An archive or upload failure produces
+`_FAILED` and a nonzero exit, while retaining the source directory and local archive for
+automatic retry on the next run.
 
 ## Optional environment variables
 
@@ -135,7 +161,7 @@ queue and force-flushes any remaining rows.
 | `TICKRECORDER_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. |
 | `TICKRECORDER_STATUS_INTERVAL_SECONDS` | `10` | Console status interval. |
 | `TICKRECORDER_TIMEZONE` | `Asia/Kolkata` | Local timestamp and receipt-date partition timezone. |
-| `TICKRECORDER_DURATION_SECONDS` | `0` | Optional finite run duration. Zero means run until SIGINT or SIGTERM. |
+| `TICKRECORDER_DURATION_SECONDS` | `0` | Zero uses the code-owned 09:15–15:31 IST market window. A positive value bypasses the wall-clock window and stops after that many seconds, primarily for testing or manual runs. |
 
 Application modules share one logger and emit action-oriented messages for startup,
 connections, subscriptions, readiness, Parquet publication, shutdown, and failures. Console
@@ -145,6 +171,14 @@ separate under `TICKRECORDER_SDK_LOG_DIR`.
 
 Successful market-data callbacks are not logged one by one. The periodic `STATUS` message
 reports aggregate event counts and queue depth without adding per-tick I/O.
+
+### Trading-session lifecycle
+
+Market timing is owned by tickrecorder, not Helm. A Job launched before 09:15 IST waits
+without opening either FYERS WebSocket. At 09:15 it connects and records into immutable
+Parquet parts. At 15:31 it requests shutdown, disconnects both sockets, drains and flushes
+the writer, creates the date archive, and uploads it to DigitalOcean Spaces. A Job launched
+after 15:31 or on a weekend exits without connecting.
 
 ## Validate configuration
 
@@ -203,17 +237,21 @@ data/
 │   │   └── part-symbolupdate-YYYYMMDD-HHMMSSffffff.parquet
 │   └── tbtdepth/
 │       └── part-tbtdepth-YYYYMMDD-HHMMSSffffff.parquet
+├── YYYYMMDD_trade_ticks.tar.gz
+├── _uploads/
+│   └── YYYYMMDD.json
 └── _runs/
     └── <run-id>/
         ├── manifest.json
         └── _SUCCESS, _DEGRADED, or _FAILED
 ```
 
-Exactly one durable completion marker is created after socket shutdown and queue drain:
+Exactly one durable completion marker is created after socket shutdown, queue drain,
+archive creation, and verified upload:
 
-- `_SUCCESS`: both feeds became ready and no feed interruption or data-quality warning was detected.
-- `_DEGRADED`: files closed cleanly, but a reconnect/socket error or sequence discontinuity occurred.
-- `_FAILED`: a feed never became ready, an outage exceeded its grace period, the writer failed, or shutdown could not be verified.
+- `_SUCCESS`: both feeds became ready, files were archived and uploaded, and no feed interruption or data-quality warning was detected.
+- `_DEGRADED`: files were archived and uploaded, but a reconnect/socket error or sequence discontinuity occurred.
+- `_FAILED`: a feed never became ready, an outage exceeded its grace period, the writer failed, shutdown could not be verified, or archive/upload verification failed.
 
 A hard process kill or bounded writer/callback shutdown timeout may leave a `.inprogress`
 file and no completion marker. Replay code should reject or quarantine such a run.
@@ -227,9 +265,10 @@ attention.
 - start/end times and stop reason;
 - received and written row counts;
 - every part filename, event range, byte size and SHA-256 checksum;
+- local archive metadata and the verified DigitalOcean object key, size, SHA-256 and ETag;
 - complete/degraded/failed status and degradation reasons.
 
-No access token is written to the manifest or application logs.
+No FYERS token or DigitalOcean credential is written to the manifest or application logs.
 
 ## Recorded datasets
 
@@ -334,12 +373,15 @@ The offline tests verify:
 - missing-versus-zero handling for SymbolUpdate;
 - sequence diagnostics;
 - typed Parquet round trips;
-- immutable part metadata and checksums.
+- immutable part metadata and checksums;
+- atomic `.tar.gz` creation, exact DigitalOcean object keys and upload verification.
 
 ## Operational notes
 
 - Stop with `Ctrl-C`, SIGINT or SIGTERM to drain the queue and create the appropriate completion marker.
 - Do not use `kill -9` during normal operation.
 - Mount `TICKRECORDER_DATA_DIR` on durable storage in containers or Kubernetes.
-- Monitor queue depth and disk space during high-volume periods.
+- Allow enough process-termination grace time for Parquet drain, gzip creation, upload and verification.
+- Monitor queue depth and disk space; the source date directory and compressed archive are both retained.
+- Run only one recorder against a given data directory while its final archive is being created.
 - The recorder does not place trades and requests no order-socket data.

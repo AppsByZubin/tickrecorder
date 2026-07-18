@@ -38,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--duration-seconds",
         type=float,
-        help="Stop automatically after this many seconds; zero runs until signalled",
+        help=(
+            "Positive values run immediately for this many seconds; zero uses "
+            "the in-code 09:15-15:31 IST market window"
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -60,6 +63,9 @@ def configure_logging(settings: Settings) -> Path:
         {
             settings.ws_token,
             settings.ws_token.split(":", 1)[-1],
+            settings.app_id,
+            settings.do_s3_access_key_id,
+            settings.do_s3_secret_access_key,
         },
     )
 
@@ -100,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
         settings.data_dir,
         settings.sdk_log_dir,
         settings.duration_seconds,
+    )
+    LOG.info(
+        "DigitalOcean upload configured destination=s3://%s/%s endpoint=%s",
+        settings.do_s3_bucket_name,
+        settings.do_s3_spaces_prefix,
+        settings.do_s3_endpoint_url,
     )
     LOG.debug("Configured FYERS symbols=%s", settings.symbols)
     if args.validate_config:

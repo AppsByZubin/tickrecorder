@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -55,6 +58,43 @@ class FakeSubscriptionInfo:
         resume_channels: set[str],
     ) -> None:
         self.channels.update(resume_channels)
+
+
+class FakeSpacesClient:
+    def __init__(
+        self,
+        remote_size_delta: int = 0,
+        fail_dates: set[str] | None = None,
+    ) -> None:
+        self.remote_size_delta = remote_size_delta
+        self.fail_dates = fail_dates or set()
+        self.uploads: list[tuple[Path, str, str]] = []
+        self._objects: dict[tuple[str, str], bytes] = {}
+        self._metadata: dict[tuple[str, str], dict[str, str]] = {}
+
+    def upload_file(
+        self,
+        local_path: str,
+        bucket: str,
+        key: str,
+        ExtraArgs: dict[str, Any],
+    ) -> None:
+        path = Path(local_path)
+        self.uploads.append((path, bucket, key))
+        if any(f"/{trading_date}/" in key for trading_date in self.fail_dates):
+            raise RuntimeError("simulated upload failure")
+        self._objects[(bucket, key)] = path.read_bytes()
+        self._metadata[(bucket, key)] = ExtraArgs["Metadata"]
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        return {
+            "ContentLength": len(self._objects[(Bucket, Key)]) + self.remote_size_delta,
+            "ETag": '"test-etag"',
+            "Metadata": self._metadata[(Bucket, Key)],
+        }
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        return {"Body": io.BytesIO(self._objects[(Bucket, Key)])}
 
 
 class FakeDataSocket:
@@ -134,8 +174,15 @@ class FakeTbtSocket:
 
 
 def settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
-    monkeypatch.setenv("FYERS_WS_TOKEN", "APP-100:test-secret")
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "test-secret")
     monkeypatch.setenv("FYERS_SYMBOLS", "NSE:TEST-EQ")
+    monkeypatch.setenv(
+        "DO_S3_ENDPOINT_URL", "https://sgp1.digitaloceanspaces.com"
+    )
+    monkeypatch.setenv("DO_S3_REGION", "sgp1")
+    monkeypatch.setenv("DO_S3_ACCESS_KEY_ID", "spaces-access-key")
+    monkeypatch.setenv("DO_S3_SECRET_ACCESS_KEY", "spaces-secret-key")
     monkeypatch.setenv("TICKRECORDER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("TICKRECORDER_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("TICKRECORDER_SDK_LOG_DIR", str(tmp_path / "sdk-logs"))
@@ -152,10 +199,25 @@ def test_recorder_writes_complete_three_stream_run(
     tmp_path: Path,
 ) -> None:
     recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    spaces_client = FakeSpacesClient()
+    recorder._spaces_client = spaces_client
     recorder.data_ws_module = SimpleNamespace(FyersDataSocket=FakeDataSocket)
     recorder.FyersTbtSocket = FakeTbtSocket
     recorder.SubscriptionModes = SimpleNamespace(DEPTH="depth")
     monkeypatch.setattr(recorder, "_load_sdk", lambda: None)
+    archive_after_shutdown = recorder._archive_and_upload_trade_ticks
+
+    def verify_shutdown_then_archive() -> None:
+        assert not recorder.writer.is_alive()
+        assert not recorder._socket_connected(recorder.data_socket)
+        assert not recorder._socket_connected(recorder.tbt_socket)
+        archive_after_shutdown()
+
+    monkeypatch.setattr(
+        recorder,
+        "_archive_and_upload_trade_ticks",
+        verify_shutdown_then_archive,
+    )
 
     assert recorder.run() == 0
     assert recorder._final_status == "complete"
@@ -173,11 +235,161 @@ def test_recorder_writes_complete_three_stream_run(
     assert len(list((date_root / "tbtdepth").glob("*.parquet"))) == 1
     assert len(list((date_root / "control").glob("*.parquet"))) >= 1
 
+    archive_path = tmp_path / "data" / f"{date_root.name}_trade_ticks.tar.gz"
+    assert archive_path.is_file()
+    assert spaces_client.uploads == [
+        (
+            archive_path,
+            "index-bucket",
+            (
+                "index-bucket-holder/contracts/"
+                f"{date_root.name}/{date_root.name}_trade_ticks.tar.gz"
+            ),
+        )
+    ]
+
     manifest = json.loads((run_root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
     assert manifest["streams_ready"] is True
     assert manifest["fatal_error"] is None
+    assert manifest["trade_tick_archives"][0]["upload_status"] == "verified"
+    assert manifest["trade_tick_archives"][0]["etag"] == "test-etag"
     assert "test-secret" not in json.dumps(manifest)
+    assert "spaces-secret-key" not in json.dumps(manifest)
+
+
+def test_upload_verification_failure_marks_run_failed_and_retains_archive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    recorder._spaces_client = FakeSpacesClient(remote_size_delta=1)
+    recorder.data_ws_module = SimpleNamespace(FyersDataSocket=FakeDataSocket)
+    recorder.FyersTbtSocket = FakeTbtSocket
+    recorder.SubscriptionModes = SimpleNamespace(DEPTH="depth")
+    monkeypatch.setattr(recorder, "_load_sdk", lambda: None)
+
+    assert recorder.run() == 1
+    assert recorder._final_status == "failed"
+    assert recorder.stop_reason == "archive_upload_failure"
+    assert (recorder.writer.run_root / "_FAILED").is_file()
+    assert not (recorder.writer.run_root / "_SUCCESS").exists()
+
+    manifest = json.loads(
+        (recorder.writer.run_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    archive_record = manifest["trade_tick_archives"][0]
+    assert archive_record["upload_status"] == "failed"
+    assert Path(archive_record["archive_path"]).is_file()
+
+
+def test_archive_upload_attempts_later_and_retained_dates_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    recorder._spaces_client = FakeSpacesClient(fail_dates={"20260717"})
+    for trading_date in ("20260717", "20260718"):
+        control_dir = tmp_path / "data" / trading_date / "control"
+        control_dir.mkdir(parents=True)
+        (control_dir / "part-control.parquet").write_bytes(b"data")
+    recorder.writer._parts = [
+        {"path": "20260718/control/part-control.parquet"},
+    ]
+
+    with pytest.raises(RuntimeError, match="20260717"):
+        recorder._archive_and_upload_trade_ticks()
+
+    assert len(recorder._spaces_client.uploads) == 2
+    records = {
+        record["trading_date"]: record
+        for record in recorder._trade_tick_archives
+    }
+    assert records["20260717"]["upload_status"] == "failed"
+    assert records["20260718"]["upload_status"] == "verified"
+    assert not (tmp_path / "data" / "_uploads" / "20260717.json").exists()
+    assert (tmp_path / "data" / "_uploads" / "20260718.json").is_file()
+
+
+def test_data_directory_lock_prevents_overlapping_recorders(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder_one = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    recorder_two = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    recorder_one._prepare_directories()
+    monkeypatch.setattr(recorder_one.writer, "is_alive", lambda: True)
+    recorder_one._release_data_directory_lock_if_safe()
+    with pytest.raises(RuntimeError, match="already using data directory"):
+        recorder_two._prepare_directories()
+
+    monkeypatch.setattr(recorder_one.writer, "is_alive", lambda: False)
+    recorder_one._release_data_directory_lock_if_safe()
+    recorder_two._prepare_directories()
+    recorder_two._release_data_directory_lock()
+
+
+def test_market_open_waits_in_code_until_0915(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    ist = ZoneInfo("Asia/Kolkata")
+    current = [datetime(2026, 7, 17, 8, 0, tzinfo=ist)]
+    waits: list[float] = []
+
+    monkeypatch.setattr(recorder, "_now_market", lambda: current[0])
+
+    def advance_to_open(timeout: float) -> bool:
+        waits.append(timeout)
+        current[0] = datetime(2026, 7, 17, 9, 15, tzinfo=ist)
+        return False
+
+    monkeypatch.setattr(recorder.stop_event, "wait", advance_to_open)
+
+    market_close = recorder._wait_for_market_open()
+
+    assert waits == [30.0]
+    assert market_close == datetime(2026, 7, 17, 15, 31, tzinfo=ist)
+
+
+def test_market_window_closed_job_does_not_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(settings(monkeypatch, tmp_path), duration_seconds=0)
+    )
+    ist = ZoneInfo("Asia/Kolkata")
+    monkeypatch.setattr(
+        recorder,
+        "_now_market",
+        lambda: datetime(2026, 7, 17, 15, 31, tzinfo=ist),
+    )
+    monkeypatch.setattr(
+        recorder,
+        "start",
+        lambda: pytest.fail("recorder must not connect after market close"),
+    )
+
+    assert recorder.run() == 0
+    assert recorder.stop_reason == "market_window_closed"
+
+
+def test_market_close_watcher_requests_disconnect_at_1531(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    ist = ZoneInfo("Asia/Kolkata")
+    market_close = datetime(2026, 7, 17, 15, 31, tzinfo=ist)
+    monkeypatch.setattr(recorder, "_now_market", lambda: market_close)
+
+    recorder._start_market_close_watcher(market_close)
+    recorder._join_market_close_watcher()
+
+    assert recorder.stop_event.is_set()
+    assert recorder.stop_reason == "market_close"
 
 
 def test_first_fatal_reason_is_preserved(
@@ -211,14 +423,21 @@ def test_control_action_is_logged_and_redacted(
     recorder._control(
         "data",
         "socket_open",
-        {"token": "APP-100:test-secret"},
-        message="connected with APP-100:test-secret",
+        {
+            "token": "APP-100:test-secret",
+            "spaces_secret": "spaces-secret-key",
+        },
+        message=(
+            "connected with APP-100:test-secret and spaces-secret-key"
+        ),
     )
 
     assert "Action component=data event=socket_open" in caplog.text
-    assert "connected with <redacted>" in caplog.text
+    assert "connected with <redacted> and <redacted>" in caplog.text
     assert "test-secret" not in caplog.text
+    assert "spaces-secret-key" not in caplog.text
     assert "test-secret" not in json.dumps(submitted, default=str)
+    assert "spaces-secret-key" not in json.dumps(submitted, default=str)
 
 
 def test_stalled_valid_callback_stream_is_fatal(

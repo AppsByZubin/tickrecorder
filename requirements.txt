@@ -1,3 +1,4 @@
+boto3>=1.28,<2
 fyers-apiv3==3.1.14
 protobuf>=5.26.1,<6
 pyarrow>=18,<24
