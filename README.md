@@ -26,6 +26,7 @@ The resulting footprint will still be a proxy because FYERS does not expose a su
 
 ```text
 tickrecorder/
+├── .github/workflows/docker-publish.yml
 ├── tickrecorder/
 │   ├── cli.py
 │   ├── config.py
@@ -375,6 +376,20 @@ The offline tests verify:
 - typed Parquet round trips;
 - immutable part metadata and checksums;
 - atomic `.tar.gz` creation, exact DigitalOcean object keys and upload verification.
+
+## Container publishing
+
+Pushes to `main` or `master`, and manual workflow dispatches, run
+`.github/workflows/docker-publish.yml`. The workflow publishes
+`docker.io/bizzkpm/tickrecorder:sha-<commit>` and `:latest`, then updates
+`helm/tickrecorder/values.yaml` in `AppsByZubin/infrastructure` to the immutable
+SHA tag.
+
+The workflow requires these tickrecorder repository secrets:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+- `INFRASTRUCTURE_REPO_TOKEN`
 
 ## Operational notes
 
