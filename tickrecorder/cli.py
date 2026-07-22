@@ -107,12 +107,15 @@ def main(argv: list[str] | None = None) -> int:
         settings.sdk_log_dir,
         settings.duration_seconds,
     )
-    LOG.info(
-        "DigitalOcean upload configured destination=s3://%s/%s endpoint=%s",
-        settings.do_s3_bucket_name,
-        settings.do_s3_spaces_prefix,
-        settings.do_s3_endpoint_url,
-    )
+    if settings.s3_upload_enabled:
+        LOG.info(
+            "DigitalOcean upload configured destination=s3://%s/%s endpoint=%s",
+            settings.do_s3_bucket_name,
+            settings.do_s3_spaces_prefix,
+            settings.do_s3_endpoint_url,
+        )
+    else:
+        LOG.info("S3 upload disabled; finalized archives will remain local")
     LOG.debug("Configured FYERS symbols=%s", settings.symbols)
     if args.validate_config:
         LOG.info("Configuration validation completed successfully")

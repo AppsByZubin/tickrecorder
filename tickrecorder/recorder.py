@@ -1289,26 +1289,26 @@ class FyersTickRecorder:
             if writer_stats["parts"]
             else ()
         )
-        trading_dates = tuple(
-            sorted(
-                set(current_dates)
-                | set(
-                    pending_trading_dates(
-                        self.settings.data_dir,
-                        self.settings.do_s3_bucket_name,
-                        self.settings.do_s3_spaces_prefix,
-                    )
+        trading_date_set = set(current_dates)
+        if self.settings.s3_upload_enabled:
+            trading_date_set.update(
+                pending_trading_dates(
+                    self.settings.data_dir,
+                    self.settings.do_s3_bucket_name,
+                    self.settings.do_s3_spaces_prefix,
                 )
             )
-        )
-        spaces = DigitalOceanSpacesConfig(
-            endpoint_url=self.settings.do_s3_endpoint_url,
-            region=self.settings.do_s3_region,
-            bucket_name=self.settings.do_s3_bucket_name,
-            prefix=self.settings.do_s3_spaces_prefix,
-            access_key_id=self.settings.do_s3_access_key_id,
-            secret_access_key=self.settings.do_s3_secret_access_key,
-        )
+        trading_dates = tuple(sorted(trading_date_set))
+        spaces = None
+        if self.settings.s3_upload_enabled:
+            spaces = DigitalOceanSpacesConfig(
+                endpoint_url=self.settings.do_s3_endpoint_url,
+                region=self.settings.do_s3_region,
+                bucket_name=self.settings.do_s3_bucket_name,
+                prefix=self.settings.do_s3_spaces_prefix,
+                access_key_id=self.settings.do_s3_access_key_id,
+                secret_access_key=self.settings.do_s3_secret_access_key,
+            )
         LOG.info("Archiving finalized trade-tick dates dates=%s", trading_dates)
         failures: list[tuple[str, BaseException]] = []
         for trading_date in trading_dates:
@@ -1321,7 +1321,7 @@ class FyersTickRecorder:
                 "sha256": None,
                 "source_fingerprint": None,
                 "upload_status": "archiving",
-                "bucket_name": spaces.bucket_name,
+                "bucket_name": spaces.bucket_name if spaces is not None else None,
                 "object_key": None,
                 "uri": None,
                 "etag": None,
@@ -1349,9 +1349,19 @@ class FyersTickRecorder:
                     "size_bytes": artifact.size_bytes,
                     "sha256": artifact.sha256,
                     "source_fingerprint": artifact.source_fingerprint,
-                    "upload_status": "uploading",
+                    "upload_status": (
+                        "uploading" if spaces is not None else "disabled"
+                    ),
                 }
             )
+            if spaces is None:
+                LOG.info(
+                    "S3 upload disabled; retained local trade-ticks archive "
+                    "date=%s path=%s",
+                    trading_date,
+                    artifact.archive_path,
+                )
+                continue
             try:
                 receipt = upload_trade_ticks_archive(
                     artifact,
@@ -1430,11 +1440,14 @@ class FyersTickRecorder:
             raise writer_error
         archive_error: BaseException | None = None
         finalized_parts = self.writer.stats()["parts"]
-        if finalized_parts or pending_trading_dates(
-            self.settings.data_dir,
-            self.settings.do_s3_bucket_name,
-            self.settings.do_s3_spaces_prefix,
-        ):
+        has_pending_uploads = self.settings.s3_upload_enabled and bool(
+            pending_trading_dates(
+                self.settings.data_dir,
+                self.settings.do_s3_bucket_name,
+                self.settings.do_s3_spaces_prefix,
+            )
+        )
+        if finalized_parts or has_pending_uploads:
             try:
                 self._archive_and_upload_trade_ticks()
             except BaseException as exc:

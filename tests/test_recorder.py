@@ -311,6 +311,39 @@ def test_archive_upload_attempts_later_and_retained_dates_after_failure(
     assert (tmp_path / "data" / "_uploads" / "20260718.json").is_file()
 
 
+def test_disabled_s3_creates_local_archive_without_upload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(settings(monkeypatch, tmp_path), s3_upload_enabled=False)
+    )
+    recorder._spaces_client = FakeSpacesClient()
+    trading_date = "20260718"
+    control_dir = tmp_path / "data" / trading_date / "control"
+    control_dir.mkdir(parents=True)
+    (control_dir / "part-control.parquet").write_bytes(b"data")
+    recorder.writer._parts = [
+        {"path": f"{trading_date}/control/part-control.parquet"},
+    ]
+
+    recorder._archive_and_upload_trade_ticks()
+
+    archive_path = tmp_path / "data" / f"{trading_date}_trade_ticks.tar.gz"
+    assert archive_path.is_file()
+    assert recorder._spaces_client.uploads == []
+    assert len(recorder._trade_tick_archives) == 1
+    archive_record = recorder._trade_tick_archives[0]
+    assert archive_record["trading_date"] == trading_date
+    assert archive_record["archive_path"] == str(archive_path)
+    assert archive_record["file_count"] == 1
+    assert archive_record["size_bytes"] == archive_path.stat().st_size
+    assert archive_record["upload_status"] == "disabled"
+    assert archive_record["bucket_name"] is None
+    assert archive_record["object_key"] is None
+    assert not (tmp_path / "data" / "_uploads" / f"{trading_date}.json").exists()
+
+
 def test_data_directory_lock_prevents_overlapping_recorders(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

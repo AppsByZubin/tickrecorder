@@ -121,7 +121,7 @@ def finalized_trading_dates(parts: list[dict[str, Any]]) -> tuple[str, ...]:
             )
         trading_dates.add(trading_date)
     if not trading_dates:
-        raise RuntimeError("Recorder produced no finalized date partitions to upload")
+        raise RuntimeError("Recorder produced no finalized date partitions to archive")
     return tuple(sorted(trading_dates))
 
 

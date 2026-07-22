@@ -129,6 +129,7 @@ class Settings:
     data_dir: Path
     log_dir: Path
     sdk_log_dir: Path
+    s3_upload_enabled: bool
     do_s3_endpoint_url: str
     do_s3_region: str
     do_s3_bucket_name: str
@@ -192,6 +193,10 @@ class Settings:
                 path = runtime_root / path
             return path.resolve()
 
+        s3_upload_enabled = _env_bool(
+            "TICKRECORDER_S3_UPLOAD_ENABLED",
+            True,
+        )
         do_s3_region = os.getenv("DO_S3_REGION", "").strip()
         do_s3_bucket_name = (
             os.getenv("DO_S3_BUCKET_NAME", "").strip() or DEFAULT_BUCKET_NAME
@@ -219,7 +224,7 @@ class Settings:
         missing_spaces_values = [
             name for name, value in required_spaces_values.items() if not value
         ]
-        if missing_spaces_values:
+        if s3_upload_enabled and missing_spaces_values:
             raise ConfigurationError(
                 "Set required DigitalOcean Spaces variables: "
                 + ", ".join(missing_spaces_values)
@@ -262,6 +267,7 @@ class Settings:
             data_dir=resolved_path(raw_data_dir),
             log_dir=resolved_path(raw_log_dir),
             sdk_log_dir=resolved_path(raw_sdk_log_dir),
+            s3_upload_enabled=s3_upload_enabled,
             do_s3_endpoint_url=do_s3_endpoint_url,
             do_s3_region=do_s3_region,
             do_s3_bucket_name=do_s3_bucket_name,

@@ -23,6 +23,7 @@ SPACES_ENV = {
 
 @pytest.fixture(autouse=True)
 def required_spaces_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TICKRECORDER_S3_UPLOAD_ENABLED", raising=False)
     for name, value in SPACES_ENV.items():
         monkeypatch.setenv(name, value)
 
@@ -54,6 +55,7 @@ def test_settings_builds_ws_token_from_required_credentials(
     assert settings.ws_token == "APP-100:secret"
     assert settings.symbols == ("NSE:NIFTY26JULFUT",)
     assert settings.data_dir == (tmp_path / "data").resolve()
+    assert settings.s3_upload_enabled is True
 
 
 def test_symbols_override_can_replace_missing_symbol_env(
@@ -166,6 +168,27 @@ def test_settings_require_spaces_credentials(
 
     with pytest.raises(ConfigurationError, match="DO_S3_SECRET_ACCESS_KEY"):
         Settings.from_env(env_file=tmp_path / "missing.env")
+
+
+def test_settings_allow_disabled_s3_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    clear_fyers_env(monkeypatch)
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "secret")
+    monkeypatch.setenv("FYERS_SYMBOLS", "NSE:ONE-EQ")
+    monkeypatch.setenv("TICKRECORDER_S3_UPLOAD_ENABLED", "false")
+    for name in SPACES_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_env(env_file=tmp_path / "missing.env")
+
+    assert settings.s3_upload_enabled is False
+    assert settings.do_s3_endpoint_url == ""
+    assert settings.do_s3_region == ""
+    assert settings.do_s3_access_key_id == ""
+    assert settings.do_s3_secret_access_key == ""
 
 
 def test_queue_timeout_must_fit_inside_shutdown_timeout(

@@ -83,16 +83,22 @@ resolved from the current working directory.
 
 ### DigitalOcean Spaces
 
-Every safely finalized date partition is archived and uploaded during recorder shutdown.
+Every safely finalized date partition is archived during recorder shutdown. S3 upload is
+enabled by default and can be disabled while retaining the local archive.
 
 | Variable | Required | Default |
 |---|---:|---|
-| `DO_S3_ENDPOINT_URL` | Yes | — |
-| `DO_S3_REGION` | Yes | — |
-| `DO_S3_ACCESS_KEY_ID` | Yes | — |
-| `DO_S3_SECRET_ACCESS_KEY` | Yes | — |
+| `TICKRECORDER_S3_UPLOAD_ENABLED` | No | `true` |
+| `DO_S3_ENDPOINT_URL` | When upload enabled | — |
+| `DO_S3_REGION` | When upload enabled | — |
+| `DO_S3_ACCESS_KEY_ID` | When upload enabled | — |
+| `DO_S3_SECRET_ACCESS_KEY` | When upload enabled | — |
 | `DO_S3_BUCKET_NAME` | No | `index-bucket` |
 | `DO_S3_SPACES_PREFIX` | No | `index-bucket-holder/contracts` |
+
+Set `TICKRECORDER_S3_UPLOAD_ENABLED=false` to keep finalized `.tar.gz` archives locally
+without requiring S3 credentials or attempting an upload. A later run with uploads enabled
+will discover and upload retained date directories that do not have verified receipts.
 
 For a `20260717` partition, the local archive and verified destination are:
 
@@ -178,8 +184,8 @@ reports aggregate event counts and queue depth without adding per-tick I/O.
 Market timing is owned by tickrecorder, not Helm. A Job launched before 09:15 IST waits
 without opening either FYERS WebSocket. At 09:15 it connects and records into immutable
 Parquet parts. At 15:31 it requests shutdown, disconnects both sockets, drains and flushes
-the writer, creates the date archive, and uploads it to DigitalOcean Spaces. A Job launched
-after 15:31 or on a weekend exits without connecting.
+the writer, creates the date archive, and uploads it to DigitalOcean Spaces when S3 upload
+is enabled. A Job launched after 15:31 or on a weekend exits without connecting.
 
 ## Validate configuration
 
@@ -248,10 +254,10 @@ data/
 ```
 
 Exactly one durable completion marker is created after socket shutdown, queue drain,
-archive creation, and verified upload:
+archive creation, and, when enabled, verified upload:
 
-- `_SUCCESS`: both feeds became ready, files were archived and uploaded, and no feed interruption or data-quality warning was detected.
-- `_DEGRADED`: files were archived and uploaded, but a reconnect/socket error or sequence discontinuity occurred.
+- `_SUCCESS`: both feeds became ready, files were archived, any enabled upload was verified, and no feed interruption or data-quality warning was detected.
+- `_DEGRADED`: files were archived and any enabled upload was verified, but a reconnect/socket error or sequence discontinuity occurred.
 - `_FAILED`: a feed never became ready, an outage exceeded its grace period, the writer failed, shutdown could not be verified, or archive/upload verification failed.
 
 A hard process kill or bounded writer/callback shutdown timeout may leave a `.inprogress`
@@ -266,7 +272,7 @@ attention.
 - start/end times and stop reason;
 - received and written row counts;
 - every part filename, event range, byte size and SHA-256 checksum;
-- local archive metadata and the verified DigitalOcean object key, size, SHA-256 and ETag;
+- local archive metadata and, when upload is enabled, the verified DigitalOcean object key, size, SHA-256 and ETag;
 - complete/degraded/failed status and degradation reasons.
 
 No FYERS token or DigitalOcean credential is written to the manifest or application logs.
@@ -375,7 +381,7 @@ The offline tests verify:
 - sequence diagnostics;
 - typed Parquet round trips;
 - immutable part metadata and checksums;
-- atomic `.tar.gz` creation, exact DigitalOcean object keys and upload verification.
+- atomic `.tar.gz` creation, optional S3 upload, exact DigitalOcean object keys and upload verification.
 
 ## Container publishing
 
@@ -396,7 +402,7 @@ The workflow requires these tickrecorder repository secrets:
 - Stop with `Ctrl-C`, SIGINT or SIGTERM to drain the queue and create the appropriate completion marker.
 - Do not use `kill -9` during normal operation.
 - Mount `TICKRECORDER_DATA_DIR` on durable storage in containers or Kubernetes.
-- Allow enough process-termination grace time for Parquet drain, gzip creation, upload and verification.
+- Allow enough process-termination grace time for Parquet drain, gzip creation, and any enabled upload and verification.
 - Monitor queue depth and disk space; the source date directory and compressed archive are both retained.
 - Run only one recorder against a given data directory while its final archive is being created.
 - The recorder does not place trades and requests no order-socket data.
