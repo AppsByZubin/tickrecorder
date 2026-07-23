@@ -18,6 +18,8 @@ from tickrecorder.spaces import (
 
 
 SUPPORTED_COMPRESSIONS = {"brotli", "gzip", "lz4", "none", "snappy", "zstd"}
+TBT_SYMBOLS_PER_CONNECTION = 5
+TBT_MAX_CONNECTIONS = 3
 
 
 class ConfigurationError(ValueError):
@@ -237,6 +239,15 @@ class Settings:
             raise ConfigurationError("FYERS_TBT_CHANNEL must be an integer from 1 to 50") from exc
         if not 1 <= channel_number <= 50:
             raise ConfigurationError("FYERS_TBT_CHANNEL must be between 1 and 50")
+        tbt_connection_count = (
+            len(symbols) + TBT_SYMBOLS_PER_CONNECTION - 1
+        ) // TBT_SYMBOLS_PER_CONNECTION
+        if tbt_connection_count > TBT_MAX_CONNECTIONS:
+            raise ConfigurationError(
+                "FYERS TBT supports at most "
+                f"{TBT_SYMBOLS_PER_CONNECTION * TBT_MAX_CONNECTIONS} symbols "
+                f"across {TBT_MAX_CONNECTIONS} connections; got {len(symbols)}"
+            )
 
         compression = os.getenv("TICKRECORDER_PARQUET_COMPRESSION", "zstd").strip().lower()
         if compression not in SUPPORTED_COMPRESSIONS:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pyarrow.parquet as pq
 import pytest
 
 from tickrecorder.config import Settings
@@ -47,10 +48,12 @@ class FakeSubscriptionInfo:
     def __init__(self) -> None:
         self.symbols: set[str] = set()
         self.channels: set[str] = set()
+        self.symbols_by_channel: dict[str, set[str]] = {}
 
     def subscribe(self, symbols: set[str], channel: str, _mode: Any) -> None:
         self.symbols.update(symbols)
         self.channels.add(channel)
+        self.symbols_by_channel.setdefault(channel, set()).update(symbols)
 
     def updateChannels(
         self,
@@ -107,24 +110,26 @@ class FakeDataSocket:
         self.restart_flag = callbacks["reconnect"]
         self.background_flag = False
         self._FyersDataSocket__ws_object: FakeWebSocket | None = None
+        self.symbols: list[str] = []
 
     def connect(self) -> None:
         self._FyersDataSocket__ws_object = FakeWebSocket()
         self.on_connect()
-        self.on_message(
-            {
-                "symbol": "NSE:TEST-EQ",
-                "type": "sf",
-                "ltp": 100.05,
-                "last_traded_qty": 5,
-                "last_traded_time": 1_000,
-                "vol_traded_today": 500,
-            }
-        )
+        for symbol in self.symbols:
+            self.on_message(
+                {
+                    "symbol": symbol,
+                    "type": "sf",
+                    "ltp": 100.05,
+                    "last_traded_qty": 5,
+                    "last_traded_time": 1_000,
+                    "vol_traded_today": 500,
+                }
+            )
 
     def subscribe(self, symbols: list[str], data_type: str) -> None:
-        assert symbols == ["NSE:TEST-EQ"]
         assert data_type == "SymbolUpdate"
+        self.symbols = symbols
 
     def close_connection(self) -> None:
         if self._FyersDataSocket__ws_object is not None:
@@ -133,6 +138,13 @@ class FakeDataSocket:
 
 
 class FakeTbtSocket:
+    _instance: FakeTbtSocket | None = None
+
+    def __new__(cls, **_callbacks: Any) -> FakeTbtSocket:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self, **callbacks: Any) -> None:
         self.on_open = callbacks["on_open"]
         self.on_close = callbacks["on_close"]
@@ -142,6 +154,7 @@ class FakeTbtSocket:
         self.restart_flag = callbacks["reconnect"]
         self.background_flag = False
         self._subsinfo = FakeSubscriptionInfo()
+        self._datastore = SimpleNamespace(depth={"stale": FakeDepth()})
         self._FyersTbtSocket__ws_object: FakeWebSocket | None = None
         self.running_thread: threading.Thread | None = None
         self._running = threading.Event()
@@ -162,7 +175,8 @@ class FakeTbtSocket:
     def connect(self) -> None:
         self._FyersTbtSocket__ws_object = FakeWebSocket()
         self.on_open()
-        self.on_depth_update("NSE:TEST-EQ", FakeDepth())
+        for symbol in sorted(self._subsinfo.symbols):
+            self.on_depth_update(symbol, FakeDepth())
 
     def close_connection(self) -> None:
         self.stop_running()
@@ -256,6 +270,76 @@ def test_recorder_writes_complete_three_stream_run(
     assert manifest["trade_tick_archives"][0]["etag"] == "test-etag"
     assert "test-secret" not in json.dumps(manifest)
     assert "spaces-secret-key" not in json.dumps(manifest)
+
+
+def test_tbt_symbols_are_partitioned_across_distinct_connections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configured_symbols = tuple(
+        f"NSE:TEST{index}-EQ" for index in range(10)
+    )
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            symbols=configured_symbols,
+            s3_upload_enabled=False,
+        )
+    )
+    recorder.data_ws_module = SimpleNamespace(FyersDataSocket=FakeDataSocket)
+    recorder.FyersTbtSocket = FakeTbtSocket
+    recorder.SubscriptionModes = SimpleNamespace(DEPTH="depth")
+    monkeypatch.setattr(recorder, "_load_sdk", lambda: None)
+
+    assert recorder.run() == 0
+    assert recorder._final_status == "complete"
+    assert len(recorder.tbt_sockets) == 2
+    assert recorder.tbt_sockets[0] is not recorder.tbt_sockets[1]
+    assert all(
+        len(socket_object._subsinfo.symbols) == 5
+        for socket_object in recorder.tbt_sockets
+    )
+    assert {
+        symbol
+        for socket_object in recorder.tbt_sockets
+        for symbol in socket_object._subsinfo.symbols
+    } == set(configured_symbols)
+    assert all(
+        socket_object._datastore.depth == {}
+        for socket_object in recorder.tbt_sockets
+    )
+    depth_rows = [
+        row
+        for depth_file in (
+            next(
+                path
+                for path in (tmp_path / "data").iterdir()
+                if path.is_dir() and path.name.isdigit()
+            )
+            / "tbtdepth"
+        ).glob("*.parquet")
+        for row in pq.ParquetFile(depth_file).read().to_pylist()
+    ]
+    symbols_by_connection: dict[str, set[str]] = {}
+    for row in depth_rows:
+        assert row["channel"] == "1"
+        symbols_by_connection.setdefault(
+            row["connection_id"],
+            set(),
+        ).add(row["symbol"])
+    assert len(symbols_by_connection) == 2
+    assert all(
+        len(symbols) == 5 for symbols in symbols_by_connection.values()
+    )
+
+    manifest = json.loads(
+        (recorder.writer.run_root / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["received_events"]["received_tbt_depth"] == 10
+    assert manifest["connection_epochs"]["tbt:1"] == 1
+    assert manifest["connection_epochs"]["tbt:2"] == 1
 
 
 def test_upload_verification_failure_marks_run_failed_and_retains_archive(

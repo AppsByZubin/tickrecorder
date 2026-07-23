@@ -16,7 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from tickrecorder import __version__
-from tickrecorder.config import Settings
+from tickrecorder.config import Settings, TBT_SYMBOLS_PER_CONNECTION
 from tickrecorder.logger import create_logger
 from tickrecorder.normalizers import (
     normalize_control_event,
@@ -77,7 +77,39 @@ class FyersTickRecorder:
         }
         self._connection_epochs = {"process": 0, "data": 0, "tbt": 0, "writer": 0}
         self._last_sequence_by_symbol: dict[str, int] = {}
-        self._tbt_symbols_seen_in_epoch: set[str] = set()
+        self._tbt_symbol_groups = tuple(
+            tuple(
+                settings.symbols[
+                    offset : offset + TBT_SYMBOLS_PER_CONNECTION
+                ]
+            )
+            for offset in range(
+                0,
+                len(settings.symbols),
+                TBT_SYMBOLS_PER_CONNECTION,
+            )
+        )
+        self._tbt_connection_keys = tuple(
+            f"tbt:{index + 1}"
+            for index in range(len(self._tbt_symbol_groups))
+        )
+        for connection_key in self._tbt_connection_keys:
+            self._connection_ids[connection_key] = str(uuid.uuid4())
+            self._connection_epochs[connection_key] = 0
+        self._tbt_connection_by_symbol = {
+            symbol.upper(): connection_key
+            for connection_key, symbols in zip(
+                self._tbt_connection_keys,
+                self._tbt_symbol_groups,
+                strict=True,
+            )
+            for symbol in symbols
+        }
+        self._tbt_symbols_seen_in_epoch = {
+            connection_key: set()
+            for connection_key in self._tbt_connection_keys
+        }
+        self._tbt_ready_connections: set[str] = set()
         self._ready_events = {
             "data": threading.Event(),
             "tbt": threading.Event(),
@@ -97,6 +129,10 @@ class FyersTickRecorder:
         self._disconnected_since: dict[str, float | None] = {
             "data": None,
             "tbt": None,
+            **{
+                connection_key: None
+                for connection_key in self._tbt_connection_keys
+            },
         }
         self._degraded_reasons: set[str] = set()
         self._streams_ready = False
@@ -118,6 +154,9 @@ class FyersTickRecorder:
 
         self.data_socket: Any = None
         self.tbt_socket: Any = None
+        self.tbt_sockets: list[Any] = [
+            None for _symbols in self._tbt_symbol_groups
+        ]
         self.data_ws_module: Any = None
         self.FyersTbtSocket: Any = None
         self.SubscriptionModes: Any = None
@@ -181,14 +220,16 @@ class FyersTickRecorder:
         component: str,
         symbol: str | None,
         channel: str | None = None,
+        connection_key: str | None = None,
     ) -> dict[str, Any]:
         wall_ns = time.time_ns()
         monotonic_ns = time.monotonic_ns()
         utc_dt = datetime.fromtimestamp(wall_ns / 1_000_000_000, tz=timezone.utc)
         local_dt = utc_dt.astimezone(self.local_timezone)
         with self._state_lock:
-            connection_id = self._connection_ids[component]
-            connection_epoch = self._connection_epochs[component]
+            state_key = connection_key or component
+            connection_id = self._connection_ids[state_key]
+            connection_epoch = self._connection_epochs[state_key]
         return {
             "schema_version": SCHEMA_VERSION,
             "run_id": self.run_id,
@@ -238,29 +279,34 @@ class FyersTickRecorder:
         severity: str = "INFO",
         message: str | None = None,
         symbol: str | None = None,
+        connection_key: str | None = None,
     ) -> None:
         common = self._common_fields(
             "control",
             component,
             symbol,
             self.settings.tbt_channel if component == "tbt" else None,
+            connection_key,
         )
         redacted_message = self._redact_text(message) if message is not None else None
         redacted_details = self._redact_value(details)
         log_method = getattr(LOG, severity.lower(), LOG.info)
+        connection_label = connection_key or component
         if redacted_message is None:
             log_method(
-                "Action component=%s event=%s symbol=%s",
+                "Action component=%s event=%s symbol=%s connection=%s",
                 component,
                 event_type,
                 symbol or "-",
+                connection_label,
             )
         else:
             log_method(
-                "Action component=%s event=%s symbol=%s message=%s",
+                "Action component=%s event=%s symbol=%s connection=%s message=%s",
                 component,
                 event_type,
                 symbol or "-",
+                connection_label,
                 redacted_message,
             )
         row = normalize_control_event(
@@ -273,19 +319,25 @@ class FyersTickRecorder:
         )
         self._submit("control", row)
 
-    def _new_connection(self, component: str) -> None:
+    def _new_connection(
+        self,
+        component: str,
+        connection_key: str | None = None,
+    ) -> None:
+        state_key = connection_key or component
         with self._state_lock:
-            previous_epoch = self._connection_epochs[component]
-            self._connection_epochs[component] += 1
-            connection_epoch = self._connection_epochs[component]
-            self._connection_ids[component] = str(uuid.uuid4())
+            previous_epoch = self._connection_epochs[state_key]
+            self._connection_epochs[state_key] += 1
+            connection_epoch = self._connection_epochs[state_key]
+            self._connection_ids[state_key] = str(uuid.uuid4())
             if component == "tbt":
-                self._tbt_symbols_seen_in_epoch.clear()
-            if component in self._disconnected_since:
-                self._disconnected_since[component] = None
+                self._tbt_symbols_seen_in_epoch[state_key].clear()
+            if state_key in self._disconnected_since:
+                self._disconnected_since[state_key] = None
         LOG.info(
-            "Connection opened component=%s epoch=%d reconnect=%s",
+            "Connection opened component=%s connection=%s epoch=%d reconnect=%s",
             component,
+            state_key,
             connection_epoch,
             previous_epoch > 0,
         )
@@ -476,7 +528,11 @@ class FyersTickRecorder:
     def on_tbt_depth(self, ticker: str, message: Any) -> None:
         try:
             ticker = str(ticker)
-            if ticker.upper() not in self._configured_symbols_upper:
+            normalized_ticker = ticker.upper()
+            connection_key = self._tbt_connection_by_symbol.get(
+                normalized_ticker
+            )
+            if connection_key is None:
                 self._control(
                     "tbt",
                     "unexpected_symbol",
@@ -487,10 +543,11 @@ class FyersTickRecorder:
                 return
             with self._state_lock:
                 previous_sequence = self._last_sequence_by_symbol.get(ticker)
-                connection_epoch = self._connection_epochs["tbt"]
+                connection_epoch = self._connection_epochs[connection_key]
                 first_after_reconnect = (
                     connection_epoch > 1
-                    and ticker not in self._tbt_symbols_seen_in_epoch
+                    and ticker
+                    not in self._tbt_symbols_seen_in_epoch[connection_key]
                     and previous_sequence is not None
                 )
             common = self._common_fields(
@@ -498,6 +555,7 @@ class FyersTickRecorder:
                 "tbt",
                 ticker,
                 self.settings.tbt_channel,
+                connection_key,
             )
             row = normalize_depth(
                 ticker=ticker,
@@ -509,7 +567,7 @@ class FyersTickRecorder:
             )
             sequence_no = row["sequence_no"]
             with self._state_lock:
-                self._tbt_symbols_seen_in_epoch.add(ticker)
+                self._tbt_symbols_seen_in_epoch[connection_key].add(ticker)
                 if sequence_no is not None:
                     self._last_sequence_by_symbol[ticker] = sequence_no
             self._submit("tbt_depth", row)
@@ -538,6 +596,7 @@ class FyersTickRecorder:
                     },
                     severity="WARNING",
                     symbol=ticker,
+                    connection_key=connection_key,
                 )
             elif base_status in {"gap", "duplicate", "regression", "reset"}:
                 severity = "WARNING" if base_status != "reset" else "INFO"
@@ -552,6 +611,7 @@ class FyersTickRecorder:
                     },
                     severity=severity,
                     symbol=ticker,
+                    connection_key=connection_key,
                 )
             if base_status in {"gap", "regression"}:
                 self._mark_degraded(f"tbt_sequence_{base_status}")
@@ -559,7 +619,11 @@ class FyersTickRecorder:
             LOG.exception("Failed to record FYERS TBT callback")
             self._set_fatal(exc, "tbt_callback_failure")
 
-    def on_tbt_server_error(self, message: Any) -> None:
+    def on_tbt_server_error(
+        self,
+        message: Any,
+        connection_key: str | None = None,
+    ) -> None:
         redacted_message = self._redact_text(message)
         if not self.stop_event.is_set():
             self._mark_degraded("tbt_server_error")
@@ -569,6 +633,7 @@ class FyersTickRecorder:
             {"payload": redacted_message},
             severity="ERROR",
             message=redacted_message,
+            connection_key=connection_key,
         )
         if not self.stop_event.is_set():
             self._set_fatal(
@@ -578,7 +643,11 @@ class FyersTickRecorder:
                 "tbt_server_error",
             )
 
-    def on_tbt_error(self, message: Any) -> None:
+    def on_tbt_error(
+        self,
+        message: Any,
+        connection_key: str | None = None,
+    ) -> None:
         redacted_message = self._redact_text(message)
         if not self.stop_event.is_set():
             self._mark_degraded("tbt_socket_error")
@@ -588,9 +657,14 @@ class FyersTickRecorder:
             {"payload": redacted_message},
             severity="ERROR",
             message=redacted_message,
+            connection_key=connection_key,
         )
 
-    def on_tbt_close(self, message: Any) -> None:
+    def on_tbt_close(
+        self,
+        message: Any,
+        connection_key: str | None = None,
+    ) -> None:
         redacted_message = self._redact_text(message)
         expected_shutdown = self.stop_event.is_set()
         if not expected_shutdown:
@@ -601,23 +675,34 @@ class FyersTickRecorder:
             {"payload": redacted_message},
             severity="INFO" if expected_shutdown else "WARNING",
             message=redacted_message,
+            connection_key=connection_key,
         )
 
-    def on_tbt_open(self) -> None:
+    def on_tbt_open(self, connection_key: str | None = None) -> None:
         if self.stop_event.is_set():
             return
-        self._new_connection("tbt")
+        connection_key = connection_key or self._tbt_connection_keys[0]
+        connection_index = self._tbt_connection_keys.index(connection_key)
+        symbols = self._tbt_symbol_groups[connection_index]
+        self._new_connection("tbt", connection_key)
         self._safe_control(
             "tbt",
             "socket_open",
             {
-                "symbols": list(self.settings.symbols),
+                "symbols": list(symbols),
                 "channel": self.settings.tbt_channel,
+                "connection": connection_key,
                 "subscription_delivery": "sdk_automatic_after_callback",
             },
+            connection_key=connection_key,
         )
-        if not self.stop_event.is_set():
-            self._ready_events["tbt"].set()
+        with self._state_lock:
+            if not self.stop_event.is_set():
+                self._tbt_ready_connections.add(connection_key)
+                if len(self._tbt_ready_connections) == len(
+                    self._tbt_connection_keys
+                ):
+                    self._ready_events["tbt"].set()
 
     def _safe_control(self, *args: Any, **kwargs: Any) -> None:
         try:
@@ -655,37 +740,80 @@ class FyersTickRecorder:
             LOG.exception("FYERS data-socket thread failed")
             self._set_fatal(exc, "data_socket_failure")
 
-    def _connect_tbt_socket(self) -> None:
+    def _new_tbt_socket(self, **kwargs: Any) -> Any:
+        socket_class = self.FyersTbtSocket
+        if "_instance" in vars(socket_class):
+            # fyers-apiv3 3.1.14 implements FyersTbtSocket as a singleton even
+            # though FYERS permits up to three TBT connections. Construct each
+            # pinned-SDK client directly so every five-symbol group has its own
+            # WebSocket and reconnect state.
+            socket_object = object.__new__(socket_class)
+            socket_class.__init__(socket_object, **kwargs)
+        else:
+            socket_object = socket_class(**kwargs)
+
+        # The pinned SDK also declares its reconstructed depth cache at class
+        # scope. Shadow it per socket to prevent cross-connection state sharing.
+        datastore = getattr(socket_object, "_datastore", None)
+        if datastore is not None and hasattr(datastore, "depth"):
+            datastore.depth = {}
+        return socket_object
+
+    def _connect_tbt_socket(
+        self,
+        connection_index: int = 0,
+        symbols: tuple[str, ...] | None = None,
+    ) -> None:
+        connection_key = self._tbt_connection_keys[connection_index]
+        connection_symbols = (
+            symbols
+            if symbols is not None
+            else self._tbt_symbol_groups[connection_index]
+        )
         try:
             self._safe_control(
                 "tbt",
                 "socket_connecting",
                 {
-                    "symbols": list(self.settings.symbols),
+                    "symbols": list(connection_symbols),
                     "channel": self.settings.tbt_channel,
+                    "connection": connection_key,
                 },
+                connection_key=connection_key,
             )
-            self.tbt_socket = self.FyersTbtSocket(
+            tbt_socket = self._new_tbt_socket(
                 access_token=self.settings.ws_token,
                 write_to_file=False,
                 log_path=str(self.settings.sdk_log_dir),
-                on_open=self.on_tbt_open,
-                on_close=self.on_tbt_close,
-                on_error=self.on_tbt_error,
+                on_open=lambda: self.on_tbt_open(connection_key),
+                on_close=lambda message: self.on_tbt_close(
+                    message,
+                    connection_key,
+                ),
+                on_error=lambda message: self.on_tbt_error(
+                    message,
+                    connection_key,
+                ),
                 on_depth_update=self.on_tbt_depth,
-                on_error_message=self.on_tbt_server_error,
+                on_error_message=lambda message: self.on_tbt_server_error(
+                    message,
+                    connection_key,
+                ),
                 reconnect=self.settings.tbt_reconnect,
                 diff_only=False,
                 reconnect_retry=self.settings.tbt_reconnect_retries,
             )
-            self.tbt_socket.background_flag = True
-            subscription_info = getattr(self.tbt_socket, "_subsinfo", None)
+            self.tbt_sockets[connection_index] = tbt_socket
+            if connection_index == 0:
+                self.tbt_socket = tbt_socket
+            tbt_socket.background_flag = True
+            subscription_info = getattr(tbt_socket, "_subsinfo", None)
             if subscription_info is None:
                 raise RuntimeError(
                     "Pinned FYERS TBT SDK no longer exposes subscription state"
                 )
             subscription_info.subscribe(
-                set(self.settings.symbols),
+                set(connection_symbols),
                 self.settings.tbt_channel,
                 self.SubscriptionModes.DEPTH,
             )
@@ -697,19 +825,21 @@ class FyersTickRecorder:
                 "tbt",
                 "subscription_registered",
                 {
-                    "symbols": list(self.settings.symbols),
+                    "symbols": list(connection_symbols),
                     "channel": self.settings.tbt_channel,
+                    "connection": connection_key,
                     "mode": "depth",
                     "diff_only": False,
                     "delivery": "sdk_automatic_on_open",
                 },
+                connection_key=connection_key,
             )
             if self.stop_event.is_set():
                 return
             # The FYERS TBT shutdown path expects this helper thread to exist.
             # Start it once per recorder, not from every reconnect callback.
-            self.tbt_socket.keep_running()
-            self.tbt_socket.connect()
+            tbt_socket.keep_running()
+            tbt_socket.connect()
         except BaseException as exc:
             LOG.exception("FYERS TBT thread failed")
             self._set_fatal(exc, "tbt_socket_failure")
@@ -819,23 +949,41 @@ class FyersTickRecorder:
 
     def _check_feed_health(self) -> None:
         now = time.monotonic()
-        for component, socket_object in (
-            ("data", self.data_socket),
-            ("tbt", self.tbt_socket),
-        ):
-            if not self._ready_events[component].is_set() or socket_object is None:
-                continue
-            if self._check_feed_staleness(component, now):
+        for component in ("data", "tbt"):
+            if (
+                self._ready_events[component].is_set()
+                and self._check_feed_staleness(component, now)
+            ):
                 return
+
+        connection_items = [
+            ("data", "data", self.data_socket),
+            *[
+                (connection_key, "tbt", socket_object)
+                for connection_key, socket_object in zip(
+                    self._tbt_connection_keys,
+                    self.tbt_sockets,
+                    strict=True,
+                )
+            ],
+        ]
+        for connection_key, component, socket_object in connection_items:
+            connection_ready = (
+                self._ready_events["data"].is_set()
+                if component == "data"
+                else connection_key in self._tbt_ready_connections
+            )
+            if not connection_ready or socket_object is None:
+                continue
             connected = self._socket_connected(socket_object)
             new_disconnect = False
             with self._state_lock:
-                disconnected_since = self._disconnected_since[component]
+                disconnected_since = self._disconnected_since[connection_key]
                 if connected:
-                    self._disconnected_since[component] = None
+                    self._disconnected_since[connection_key] = None
                 elif disconnected_since is None:
                     disconnected_since = now
-                    self._disconnected_since[component] = now
+                    self._disconnected_since[connection_key] = now
                     new_disconnect = True
 
             if connected:
@@ -847,9 +995,11 @@ class FyersTickRecorder:
                     component,
                     "disconnect_detected",
                     {
+                        "connection": connection_key,
                         "grace_seconds": self.settings.disconnect_grace_seconds,
                     },
                     severity="WARNING",
+                    connection_key=connection_key,
                 )
 
             reconnect_attempts = int(getattr(socket_object, "reconnect_attempts", 0))
@@ -875,6 +1025,7 @@ class FyersTickRecorder:
                     component,
                     reason,
                     {
+                        "connection": connection_key,
                         "outage_seconds": outage_seconds,
                         "reconnect_attempts": reconnect_attempts,
                         "max_reconnect_attempts": max_attempts,
@@ -882,6 +1033,7 @@ class FyersTickRecorder:
                     },
                     severity="ERROR",
                     message=str(exc),
+                    connection_key=connection_key,
                 )
                 self._set_fatal(exc, reason)
                 return
@@ -928,9 +1080,10 @@ class FyersTickRecorder:
 
     def start(self) -> None:
         LOG.info(
-            "Starting recorder run=%s symbols=%d data_dir=%s",
+            "Starting recorder run=%s symbols=%d tbt_connections=%d data_dir=%s",
             self.run_id,
             len(self.settings.symbols),
+            len(self._tbt_symbol_groups),
             self.settings.data_dir,
         )
         if self._data_lock_handle is None:
@@ -947,6 +1100,18 @@ class FyersTickRecorder:
                 "pid": os.getpid(),
                 "hostname": socket.gethostname(),
                 "symbols": list(self.settings.symbols),
+                "tbt_connections": [
+                    {
+                        "connection": connection_key,
+                        "symbols": list(symbols),
+                        "channel": self.settings.tbt_channel,
+                    }
+                    for connection_key, symbols in zip(
+                        self._tbt_connection_keys,
+                        self._tbt_symbol_groups,
+                        strict=True,
+                    )
+                ],
             },
         )
 
@@ -955,12 +1120,18 @@ class FyersTickRecorder:
             name="fyers-data-connector",
             daemon=True,
         )
-        tbt_thread = threading.Thread(
-            target=self._connect_tbt_socket,
-            name="fyers-tbt-connector",
-            daemon=True,
-        )
-        self._threads = [data_thread, tbt_thread]
+        tbt_threads = [
+            threading.Thread(
+                target=self._connect_tbt_socket,
+                args=(connection_index, symbols),
+                name=f"fyers-tbt-connector-{connection_index + 1}",
+                daemon=True,
+            )
+            for connection_index, symbols in enumerate(
+                self._tbt_symbol_groups
+            )
+        ]
+        self._threads = [data_thread, *tbt_threads]
         for thread in self._threads:
             thread.start()
         LOG.info(
@@ -1171,7 +1342,10 @@ class FyersTickRecorder:
         )
         deadline = time.monotonic() + self.settings.shutdown_timeout_seconds
         socket_items = [
-            ("tbt", self.tbt_socket),
+            *[
+                (f"tbt-{index + 1}", socket_object)
+                for index, socket_object in enumerate(self.tbt_sockets)
+            ],
             ("data", self.data_socket),
         ]
         close_threads: list[tuple[str, threading.Thread]] = []

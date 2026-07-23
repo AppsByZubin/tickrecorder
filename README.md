@@ -81,6 +81,11 @@ resolved from the current working directory.
 
 `FYERS_SYMBOL` is accepted as a backwards-compatible single-symbol fallback, but `FYERS_SYMBOLS` is preferred.
 
+FYERS permits five TBT symbols per connection and up to three simultaneous TBT
+connections. `tickrecorder` automatically partitions the configured symbols into
+five-symbol connections, so one recorder supports up to 15 symbols. The regular
+`SymbolUpdate` socket continues to subscribe to the complete configured list.
+
 ### DigitalOcean Spaces
 
 Every safely finalized date partition is archived during recorder shutdown. S3 upload is
@@ -121,7 +126,7 @@ automatic retry on the next run.
 
 | Variable | Default | Description |
 |---|---:|---|
-| `FYERS_TBT_CHANNEL` | `1` | TBT channel number from 1 through 50. |
+| `FYERS_TBT_CHANNEL` | `1` | TBT channel number from 1 through 50, used independently on every five-symbol TBT connection. |
 | `TICKRECORDER_DATA_RECONNECT` | `true` | Enable regular FYERS data-socket reconnects. |
 | `TICKRECORDER_DATA_RECONNECT_RETRIES` | `20` | Maximum SDK data-socket reconnect attempts (1 through 50). |
 | `TICKRECORDER_TBT_RECONNECT` | `true` | Enable TBT-socket reconnects. |

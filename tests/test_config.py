@@ -74,6 +74,31 @@ def test_symbols_override_can_replace_missing_symbol_env(
     assert settings.symbols == ("NSE:ONE-EQ", "NSE:TWO-EQ")
 
 
+def test_settings_enforce_three_tbt_connection_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    clear_fyers_env(monkeypatch)
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "secret")
+    monkeypatch.setenv(
+        "FYERS_SYMBOLS",
+        ",".join(f"NSE:TEST{index}-EQ" for index in range(15)),
+    )
+
+    assert len(
+        Settings.from_env(env_file=tmp_path / "missing.env").symbols
+    ) == 15
+
+    monkeypatch.setenv(
+        "FYERS_SYMBOLS",
+        ",".join(f"NSE:TEST{index}-EQ" for index in range(16)),
+    )
+
+    with pytest.raises(ConfigurationError, match="at most 15 symbols"):
+        Settings.from_env(env_file=tmp_path / "missing.env")
+
+
 def test_relative_paths_resolve_from_env_file_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
