@@ -38,6 +38,8 @@ from tickrecorder.writer import EventEnvelope, ParquetEventWriter
 LOG = create_logger(__name__)
 MARKET_OPEN_TIME = wall_time(9, 15)
 MARKET_CLOSE_TIME = wall_time(15, 31)
+DATA_CALLBACK_SETTLE_SECONDS = 0.05
+DATA_HEALTH_SETTLE_SECONDS = 2.0
 
 
 class FyersTickRecorder:
@@ -64,6 +66,7 @@ class FyersTickRecorder:
         self._stats_lock = threading.Lock()
         self._stats: Counter[str] = Counter()
         self._state_lock = threading.RLock()
+        self._data_connection_lock = threading.RLock()
         self._fatal_lock = threading.Lock()
         self._quality_lock = threading.Lock()
         self._submission_condition = threading.Condition()
@@ -151,6 +154,10 @@ class FyersTickRecorder:
         self._configured_symbols_upper = {
             configured.upper() for configured in self.settings.symbols
         }
+        self._data_connection_reconciliations: list[dict[str, Any]] = []
+        self._pending_data_connection_reconciliations: list[dict[str, Any]] = []
+        self._data_connection_worker: threading.Thread | None = None
+        self._data_connection_workers: list[threading.Thread] = []
 
         self.data_socket: Any = None
         self.tbt_socket: Any = None
@@ -501,29 +508,244 @@ class FyersTickRecorder:
         )
 
     def on_data_open(self) -> None:
-        if not self._wait_until_connected("data", self.data_socket):
+        completion_event: threading.Event | None = None
+        with self._data_connection_lock:
+            if self.stop_event.is_set():
+                return
+            if (
+                not self._ready_events["data"].is_set()
+                and not self._wait_until_connected("data", self.data_socket)
+            ):
+                return
+            _scheduled, completion_event = (
+                self._dispatch_data_connection_reconciliation_locked(
+                    from_sdk_callback=True
+                )
+            )
+
+        # Preserve the SDK callback's historical ordering: connect() must not
+        # return before this genuine connection has been subscribed. The work
+        # itself runs on a tracked daemon so health polling never performs the
+        # SDK's blocking symbol-token request on MainThread.
+        while (
+            completion_event is not None
+            and not self.stop_event.is_set()
+            and not completion_event.wait(0.1)
+        ):
+            pass
+
+    def _reconcile_data_connection(self) -> bool:
+        with self._data_connection_lock:
+            scheduled, _completion_event = (
+                self._dispatch_data_connection_reconciliation_locked(
+                    from_sdk_callback=False
+                )
+            )
+            return scheduled
+
+    def _dispatch_data_connection_reconciliation_locked(
+        self,
+        *,
+        from_sdk_callback: bool,
+    ) -> tuple[bool, threading.Event | None]:
+        if self.stop_event.is_set():
+            return False, None
+
+        socket_object = self.data_socket
+        if socket_object is None:
+            return False, None
+        websocket_object = self._sdk_websocket(socket_object)
+        if (
+            websocket_object is None
+            or not self._socket_connected(socket_object)
+            or self._sdk_websocket(socket_object) is not websocket_object
+        ):
+            return False, None
+
+        now = time.monotonic()
+        not_before = now + (
+            DATA_CALLBACK_SETTLE_SECONDS
+            if from_sdk_callback
+            else DATA_HEALTH_SETTLE_SECONDS
+        )
+        self._data_connection_reconciliations = [
+            reconciliation
+            for reconciliation in self._data_connection_reconciliations
+            if (
+                not reconciliation["completion_event"].is_set()
+                or reconciliation["websocket"] is websocket_object
+            )
+        ]
+        for reconciliation in self._data_connection_reconciliations:
+            if reconciliation["websocket"] is websocket_object:
+                if from_sdk_callback:
+                    reconciliation["not_before"] = min(
+                        reconciliation["not_before"],
+                        not_before,
+                    )
+                return True, reconciliation["completion_event"]
+
+        reconciliation = {
+            "socket": socket_object,
+            "websocket": websocket_object,
+            "not_before": not_before,
+            "completion_event": threading.Event(),
+        }
+        self._data_connection_reconciliations.append(reconciliation)
+        self._pending_data_connection_reconciliations.append(reconciliation)
+        if self._data_connection_worker is None:
+            worker = threading.Thread(
+                target=self._run_data_connection_reconciler,
+                name="data-connection-reconciler",
+                daemon=True,
+            )
+            self._data_connection_worker = worker
+            self._data_connection_workers = [
+                existing
+                for existing in self._data_connection_workers
+                if existing.is_alive()
+            ]
+            self._data_connection_workers.append(worker)
+            worker.start()
+        return True, reconciliation["completion_event"]
+
+    def _run_data_connection_reconciler(self) -> None:
+        current_thread = threading.current_thread()
+        while True:
+            with self._data_connection_lock:
+                if self.stop_event.is_set():
+                    abandoned = list(
+                        self._pending_data_connection_reconciliations
+                    )
+                    self._pending_data_connection_reconciliations.clear()
+                    if self._data_connection_worker is current_thread:
+                        self._data_connection_worker = None
+                    for reconciliation in abandoned:
+                        reconciliation["completion_event"].set()
+                    return
+                if not self._pending_data_connection_reconciliations:
+                    if self._data_connection_worker is current_thread:
+                        self._data_connection_worker = None
+                    return
+                reconciliation = (
+                    self._pending_data_connection_reconciliations.pop(0)
+                )
+
+            try:
+                self._activate_data_connection(reconciliation)
+            except BaseException as exc:
+                if not self.stop_event.is_set():
+                    LOG.exception("Data-connection reconciliation failed")
+                    self._set_fatal(
+                        exc,
+                        "data_connection_reconciliation_failure",
+                    )
+            finally:
+                reconciliation["completion_event"].set()
+
+    def _data_websocket_is_current(
+        self,
+        socket_object: Any,
+        websocket_object: Any,
+    ) -> bool:
+        return bool(
+            not self.stop_event.is_set()
+            and socket_object is self.data_socket
+            and self._sdk_websocket(socket_object) is websocket_object
+            and self._socket_connected(socket_object)
+            and self._sdk_websocket(socket_object) is websocket_object
+        )
+
+    @staticmethod
+    def _data_socket_callback_state_ready(socket_object: Any) -> bool:
+        if not hasattr(socket_object, "message_thread_stop_event"):
+            return True
+        stop_event = getattr(socket_object, "message_thread_stop_event", None)
+        message_thread = getattr(socket_object, "message_thread", None)
+        return bool(
+            stop_event is not None
+            and not stop_event.is_set()
+            and isinstance(message_thread, threading.Thread)
+            and message_thread.is_alive()
+        )
+
+    def _wait_for_data_connection_settle(
+        self,
+        reconciliation: dict[str, Any],
+    ) -> bool:
+        socket_object = reconciliation["socket"]
+        websocket_object = reconciliation["websocket"]
+        while self._data_websocket_is_current(
+            socket_object,
+            websocket_object,
+        ):
+            with self._data_connection_lock:
+                remaining = reconciliation["not_before"] - time.monotonic()
+            if remaining > 0:
+                self.stop_event.wait(min(0.05, remaining))
+                continue
+            if self._data_socket_callback_state_ready(socket_object):
+                return True
+            self.stop_event.wait(0.01)
+        return False
+
+    def _activate_data_connection(
+        self,
+        reconciliation: dict[str, Any],
+    ) -> None:
+        socket_object = reconciliation["socket"]
+        websocket_object = reconciliation["websocket"]
+        if not self._wait_for_data_connection_settle(reconciliation):
+            return
+        if not self._data_websocket_is_current(
+            socket_object,
+            websocket_object,
+        ):
             return
         self._new_connection("data")
+        if not self._data_websocket_is_current(
+            socket_object,
+            websocket_object,
+        ):
+            return
         self._safe_control(
             "data",
             "socket_open",
             {"symbols": list(self.settings.symbols)},
         )
+        if not self._data_websocket_is_current(
+            socket_object,
+            websocket_object,
+        ):
+            return
         try:
-            self.data_socket.subscribe(
+            socket_object.subscribe(
                 symbols=list(self.settings.symbols),
                 data_type="SymbolUpdate",
             )
+            if not self._data_websocket_is_current(
+                socket_object,
+                websocket_object,
+            ):
+                return
             self._safe_control(
                 "data",
                 "subscribe_sent",
                 {"symbols": list(self.settings.symbols), "data_type": "SymbolUpdate"},
             )
-            if not self.stop_event.is_set():
-                self._ready_events["data"].set()
+            if not self._data_websocket_is_current(
+                socket_object,
+                websocket_object,
+            ):
+                return
+            self._ready_events["data"].set()
         except BaseException as exc:
-            LOG.exception("Data-socket subscription failed")
-            self._set_fatal(exc, "data_subscription_failure")
+            if self._data_websocket_is_current(
+                socket_object,
+                websocket_object,
+            ):
+                LOG.exception("Data-socket subscription failed")
+                self._set_fatal(exc, "data_subscription_failure")
 
     def on_tbt_depth(self, ticker: str, message: Any) -> None:
         try:
@@ -948,6 +1170,9 @@ class FyersTickRecorder:
         return not self.stop_event.is_set()
 
     def _check_feed_health(self) -> None:
+        self._reconcile_data_connection()
+        if self.stop_event.is_set():
+            return
         now = time.monotonic()
         for component in ("data", "tbt"):
             if (
@@ -1006,8 +1231,37 @@ class FyersTickRecorder:
             max_attempts = int(
                 getattr(socket_object, "max_reconnect_attempts", 0)
             )
-            retries_exhausted = (
+            retries_at_limit = (
                 max_attempts > 0 and reconnect_attempts >= max_attempts
+            )
+            reconnect_worker_attribute = next(
+                (
+                    attribute
+                    for attribute in ("ws_thread", "t", "websocket_task")
+                    if hasattr(socket_object, attribute)
+                ),
+                None,
+            )
+            has_reconnect_worker = reconnect_worker_attribute is not None
+            reconnect_worker = (
+                getattr(socket_object, reconnect_worker_attribute, None)
+                if reconnect_worker_attribute is not None
+                else None
+            )
+            worker_is_alive = getattr(reconnect_worker, "is_alive", None)
+            try:
+                reconnect_worker_alive = bool(
+                    callable(worker_is_alive) and worker_is_alive()
+                )
+            except BaseException:
+                reconnect_worker_alive = False
+            reconnect_worker_pending = bool(
+                isinstance(reconnect_worker, threading.Thread)
+                and reconnect_worker.ident is None
+            )
+            retries_exhausted = retries_at_limit and (
+                not has_reconnect_worker
+                or not (reconnect_worker_alive or reconnect_worker_pending)
             )
             outage_seconds = now - disconnected_since
             grace_expired = outage_seconds >= self.settings.disconnect_grace_seconds
@@ -1405,6 +1659,10 @@ class FyersTickRecorder:
                 for thread in self._sdk_worker_threads(socket_object)
             )
         worker_threads.extend(("connector", thread) for thread in self._threads)
+        worker_threads.extend(
+            ("data-reconciler", thread)
+            for thread in self._data_connection_workers
+        )
 
         current_thread = threading.current_thread()
         for component, thread in worker_threads:

@@ -29,6 +29,42 @@ class FakeWebSocket:
         self.sock = FakeSock()
 
 
+class FakeReconnectDataSocket:
+    """Model FYERS callbacks that can run before a handshake succeeds."""
+
+    def __init__(self) -> None:
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 20
+        self._FyersDataSocket__ws_object: FakeWebSocket | None = None
+        self.subscriptions: list[tuple[tuple[str, ...], str]] = []
+
+    def start_attempt(self) -> None:
+        self._FyersDataSocket__ws_object = None
+
+    def complete_attempt(self) -> None:
+        self._FyersDataSocket__ws_object = FakeWebSocket()
+
+    def disconnect(self) -> None:
+        websocket = self._FyersDataSocket__ws_object
+        if websocket is not None:
+            websocket.sock.connected = False
+
+    def subscribe(self, symbols: list[str], data_type: str) -> None:
+        self.subscriptions.append((tuple(symbols), data_type))
+
+
+class FakeMonotonicClock:
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wait(self, timeout: float) -> bool:
+        self.now += timeout
+        return False
+
+
 class FakeDepth:
     tbq = 1_000
     tsq = 900
@@ -521,6 +557,397 @@ def test_first_fatal_reason_is_preserved(
 
     assert recorder._fatal_error is first
     assert recorder.stop_reason == "first_reason"
+
+
+def test_established_data_false_open_callback_does_not_reuse_initial_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            connect_timeout_seconds=15,
+            disconnect_grace_seconds=30,
+        )
+    )
+    socket = FakeReconnectDataSocket()
+    recorder.data_socket = socket
+    recorder._ready_events["data"].set()
+    recorder._streams_ready = True
+    recorder._connection_epochs["data"] = 1
+    original_connection_id = recorder._connection_ids["data"]
+    clock = FakeMonotonicClock()
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+
+    monkeypatch.setattr("tickrecorder.recorder.time.monotonic", clock.monotonic)
+    monkeypatch.setattr(recorder.stop_event, "wait", clock.wait)
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    # The pinned FYERS data SDK invokes its application callback after a fixed
+    # delay even when no WebSocket handshake completed.
+    socket.start_attempt()
+    recorder.on_data_open()
+
+    assert clock.now == 100.0
+    assert recorder._fatal_error is None
+    assert not recorder.stop_event.is_set()
+    assert recorder.stop_reason == "not_stopped"
+    assert recorder._connection_epochs["data"] == 1
+    assert recorder._connection_ids["data"] == original_connection_id
+    assert socket.subscriptions == []
+    assert all(event_type != "connect_timeout" for _, event_type, _, _ in controls)
+
+
+def test_health_poll_reconciles_data_reconnect_once_after_false_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            connect_timeout_seconds=15,
+            disconnect_grace_seconds=30,
+            stale_feed_timeout_seconds=0,
+        )
+    )
+    socket = FakeReconnectDataSocket()
+    recorder.data_socket = socket
+    clock = FakeMonotonicClock()
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+
+    monkeypatch.setattr("tickrecorder.recorder.time.monotonic", clock.monotonic)
+    monkeypatch.setattr(recorder.stop_event, "wait", clock.wait)
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    socket.complete_attempt()
+    recorder.on_data_open()
+    recorder._streams_ready = True
+    initial_connection_id = recorder._connection_ids["data"]
+
+    socket.disconnect()
+    recorder._check_feed_health()
+    outage_started_at = clock.now
+    recorder._check_feed_health()
+    assert recorder._disconnected_since["data"] == outage_started_at
+
+    clock.now = 110.0
+    socket.start_attempt()
+    recorder.on_data_open()
+    recorder.on_data_open()
+    assert recorder._fatal_error is None
+
+    # FYERS does not issue another application callback when the underlying
+    # handshake later succeeds, so health polling must discover and reconcile it.
+    clock.now = 120.0
+    socket.complete_attempt()
+    recorder._check_feed_health()
+    recorder._check_feed_health()
+    recorder.on_data_open()
+
+    event_types = [event_type for _, event_type, _, _ in controls]
+    assert recorder._fatal_error is None
+    assert not recorder.stop_event.is_set()
+    assert recorder._disconnected_since["data"] is None
+    assert recorder._connection_epochs["data"] == 2
+    assert recorder._connection_ids["data"] != initial_connection_id
+    assert socket.subscriptions == [
+        (("NSE:TEST-EQ",), "SymbolUpdate"),
+        (("NSE:TEST-EQ",), "SymbolUpdate"),
+    ]
+    assert event_types.count("disconnect_detected") == 1
+    assert event_types.count("socket_open") == 2
+    assert event_types.count("subscribe_sent") == 2
+    assert "connect_timeout" not in event_types
+    assert "data_connection_interrupted" in recorder._degraded_reasons
+    assert "data_reconnected" in recorder._degraded_reasons
+
+
+def test_initial_data_false_open_callback_still_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(settings(monkeypatch, tmp_path), connect_timeout_seconds=1)
+    )
+    socket = FakeReconnectDataSocket()
+    recorder.data_socket = socket
+    clock = FakeMonotonicClock()
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+
+    monkeypatch.setattr("tickrecorder.recorder.time.monotonic", clock.monotonic)
+    monkeypatch.setattr(recorder.stop_event, "wait", clock.wait)
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    socket.start_attempt()
+    recorder.on_data_open()
+
+    assert clock.now == pytest.approx(101.0)
+    assert isinstance(recorder._fatal_error, RuntimeError)
+    assert recorder.stop_event.is_set()
+    assert recorder.stop_reason == "data_connect_timeout"
+    assert not recorder._ready_events["data"].is_set()
+    assert recorder._connection_epochs["data"] == 0
+    assert socket.subscriptions == []
+    assert [event_type for _, event_type, _, _ in controls] == ["connect_timeout"]
+
+
+def test_established_data_disconnect_fails_at_grace_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            connect_timeout_seconds=15,
+            disconnect_grace_seconds=30,
+            stale_feed_timeout_seconds=0,
+        )
+    )
+    socket = FakeReconnectDataSocket()
+    recorder.data_socket = socket
+    clock = FakeMonotonicClock()
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+
+    monkeypatch.setattr("tickrecorder.recorder.time.monotonic", clock.monotonic)
+    monkeypatch.setattr(recorder.stop_event, "wait", clock.wait)
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    socket.complete_attempt()
+    recorder.on_data_open()
+    recorder._streams_ready = True
+    socket.disconnect()
+    recorder._check_feed_health()
+    outage_started_at = clock.now
+
+    clock.now = outage_started_at + 29.999
+    recorder._check_feed_health()
+    assert recorder._fatal_error is None
+    assert not recorder.stop_event.is_set()
+
+    clock.now = outage_started_at + 30.0
+    recorder._check_feed_health()
+
+    event_types = [event_type for _, event_type, _, _ in controls]
+    timeout_details = next(
+        details for _, event_type, details, _ in controls if event_type == "data_disconnect_timeout"
+    )
+    assert isinstance(recorder._fatal_error, RuntimeError)
+    assert recorder.stop_event.is_set()
+    assert recorder.stop_reason == "data_disconnect_timeout"
+    assert event_types.count("disconnect_detected") == 1
+    assert event_types.count("data_disconnect_timeout") == 1
+    assert "connect_timeout" not in event_types
+    assert timeout_details["outage_seconds"] == pytest.approx(30.0)
+    assert timeout_details["grace_seconds"] == 30
+    assert timeout_details["reconnect_attempts"] == 0
+    assert timeout_details["max_reconnect_attempts"] == 20
+
+
+def test_health_dispatches_blocking_data_subscribe_and_stop_releases_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    subscribe_started = threading.Event()
+    release_subscribe = threading.Event()
+    callback_returned = threading.Event()
+    main_thread = threading.current_thread()
+
+    class BlockingSubscribeDataSocket(FakeReconnectDataSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscribe_thread: threading.Thread | None = None
+
+        def subscribe(self, symbols: list[str], data_type: str) -> None:
+            self.subscribe_thread = threading.current_thread()
+            subscribe_started.set()
+            if self.subscribe_thread is main_thread:
+                raise AssertionError("health polling subscribed on MainThread")
+            release_subscribe.wait()
+            super().subscribe(symbols, data_type)
+
+        def close_connection(self) -> None:
+            self.disconnect()
+
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            stale_feed_timeout_seconds=0,
+            shutdown_timeout_seconds=0.05,
+        )
+    )
+    socket = BlockingSubscribeDataSocket()
+    socket.complete_attempt()
+    recorder.data_socket = socket
+    recorder._ready_events["data"].set()
+    recorder._streams_ready = True
+    recorder._connection_epochs["data"] = 1
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    def sdk_callback() -> None:
+        recorder.on_data_open()
+        callback_returned.set()
+
+    callback_thread = threading.Thread(
+        target=sdk_callback,
+        name="test-sdk-data-open",
+        daemon=True,
+    )
+
+    try:
+        recorder._check_feed_health()
+        assert recorder._fatal_error is None
+        callback_thread.start()
+
+        assert subscribe_started.wait(timeout=0.5)
+        assert socket.subscribe_thread is not main_thread
+        assert not callback_returned.is_set()
+        assert len(recorder._data_connection_workers) == 1
+        worker = recorder._data_connection_workers[0]
+        assert worker.is_alive()
+        assert worker.daemon is True
+
+        recorder.request_stop("test_stop")
+
+        assert callback_returned.wait(timeout=0.5)
+        callback_thread.join(timeout=0.1)
+        assert not callback_thread.is_alive()
+        assert worker.is_alive()
+
+        recorder._shutdown_sockets()
+
+        shutdown_details = next(
+            details
+            for _, event_type, details, _ in controls
+            if event_type == "socket_shutdown"
+        )
+        assert any(
+            "data-reconciler: worker thread still alive" in error
+            for error in shutdown_details["errors"]
+        )
+        assert {
+            "component": "data-reconciler",
+            "name": worker.name,
+            "alive": True,
+            "daemon": True,
+        } in shutdown_details["worker_threads"]
+        assert recorder.stop_reason == "socket_shutdown_failure"
+    finally:
+        release_subscribe.set()
+        if callback_thread.ident is not None:
+            callback_thread.join(timeout=0.5)
+        for worker in recorder._data_connection_workers:
+            worker.join(timeout=0.5)
+
+    assert all(not worker.is_alive() for worker in recorder._data_connection_workers)
+
+
+def test_final_in_flight_data_retry_is_not_exhausted_until_thread_stops(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            disconnect_grace_seconds=30,
+            stale_feed_timeout_seconds=0,
+        )
+    )
+    socket = FakeReconnectDataSocket()
+    socket.start_attempt()
+    socket.reconnect_attempts = socket.max_reconnect_attempts
+    recorder.data_socket = socket
+    recorder._ready_events["data"].set()
+    recorder._streams_ready = True
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+
+    attempt_started = threading.Event()
+    finish_attempt = threading.Event()
+
+    def final_attempt() -> None:
+        attempt_started.set()
+        finish_attempt.wait()
+
+    socket.ws_thread = threading.Thread(
+        target=final_attempt,
+        name="test-final-data-reconnect",
+        daemon=True,
+    )
+    recorder._check_feed_health()
+    assert recorder._fatal_error is None
+    assert not recorder.stop_event.is_set()
+
+    socket.ws_thread.start()
+
+    try:
+        assert attempt_started.wait(timeout=0.5)
+        recorder._check_feed_health()
+
+        event_types = [event_type for _, event_type, _, _ in controls]
+        assert recorder._fatal_error is None
+        assert not recorder.stop_event.is_set()
+        assert event_types.count("disconnect_detected") == 1
+        assert "data_reconnect_exhausted" not in event_types
+
+        finish_attempt.set()
+        socket.ws_thread.join(timeout=0.5)
+        assert not socket.ws_thread.is_alive()
+
+        recorder._check_feed_health()
+    finally:
+        finish_attempt.set()
+        socket.ws_thread.join(timeout=0.5)
+
+    event_types = [event_type for _, event_type, _, _ in controls]
+    exhausted_details = next(
+        details
+        for _, event_type, details, _ in controls
+        if event_type == "data_reconnect_exhausted"
+    )
+    assert isinstance(recorder._fatal_error, RuntimeError)
+    assert recorder.stop_event.is_set()
+    assert recorder.stop_reason == "data_reconnect_exhausted"
+    assert event_types.count("data_reconnect_exhausted") == 1
+    assert exhausted_details["reconnect_attempts"] == 20
+    assert exhausted_details["max_reconnect_attempts"] == 20
+    assert exhausted_details["outage_seconds"] < 30
 
 
 def test_control_action_is_logged_and_redacted(
