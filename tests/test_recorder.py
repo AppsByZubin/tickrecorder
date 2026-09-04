@@ -27,6 +27,11 @@ class FakeSock:
 class FakeWebSocket:
     def __init__(self) -> None:
         self.sock = FakeSock()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.sock.connected = False
 
 
 class FakeReconnectDataSocket:
@@ -991,6 +996,7 @@ def test_stalled_valid_callback_stream_is_fatal(
     recorder_settings = replace(
         settings(monkeypatch, tmp_path),
         stale_feed_timeout_seconds=1,
+        stale_feed_retries=0,
     )
     recorder = FyersTickRecorder(recorder_settings)
     recorder._streams_ready = True
@@ -1001,3 +1007,78 @@ def test_stalled_valid_callback_stream_is_fatal(
 
     assert recorder._check_feed_staleness("data", time.monotonic()) is True
     assert recorder.stop_reason == "data_feed_stale"
+
+
+def test_stale_tbt_feed_restarts_transport_before_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(
+        replace(
+            settings(monkeypatch, tmp_path),
+            stale_feed_timeout_seconds=1,
+            stale_feed_retries=2,
+        )
+    )
+    socket = FakeTbtSocket(
+        on_open=lambda: None,
+        on_close=lambda message: None,
+        on_depth_update=lambda ticker, message: None,
+        reconnect_retry=20,
+        reconnect=True,
+    )
+    socket._FyersTbtSocket__ws_object = FakeWebSocket()
+    recorder.tbt_sockets[0] = socket
+    recorder.tbt_socket = socket
+    recorder._streams_ready = True
+    recorder._ready_events["tbt"].set()
+    recorder._tbt_ready_connections.add("tbt:1")
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+    now = time.monotonic()
+    recorder._last_valid_event_monotonic["tbt"]["NSE:TEST-EQ"] = now - 2
+
+    assert recorder._check_feed_staleness("tbt", now) is False
+    assert recorder._fatal_error is None
+    assert socket._FyersTbtSocket__ws_object.close_calls == 1
+    assert recorder._stale_feed_retry_attempts["tbt:1"] == 1
+    retry = next(details for _, event, details, _ in controls if event == "feed_stale_retry")
+    assert retry["attempt"] == 1
+    assert retry["max_retries"] == 2
+
+    later = now + 1
+    assert recorder._check_feed_staleness("tbt", later) is False
+    assert recorder._stale_feed_retry_attempts["tbt:1"] == 2
+
+    assert recorder._check_feed_staleness("tbt", later + 1) is True
+    assert recorder.stop_reason == "tbt_feed_stale"
+
+
+def test_fresh_callbacks_reset_stale_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = FyersTickRecorder(settings(monkeypatch, tmp_path))
+    controls: list[tuple[str, str, Any, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        recorder,
+        "_safe_control",
+        lambda component, event_type, details, **kwargs: controls.append(
+            (component, event_type, details, kwargs)
+        ),
+    )
+    recorder._stale_feed_retry_attempts["tbt:1"] = 1
+    recorder._stale_feed_retry_started_at["tbt:1"] = time.monotonic() - 1
+    recorder._last_valid_event_monotonic["tbt"]["NSE:TEST-EQ"] = time.monotonic()
+
+    recorder._record_stale_feed_recovery("tbt", "NSE:TEST-EQ")
+
+    assert recorder._stale_feed_retry_attempts["tbt:1"] == 0
+    assert recorder._stale_feed_retry_started_at["tbt:1"] is None
+    assert [event for _, event, _, _ in controls] == ["feed_recovered"]

@@ -148,6 +148,7 @@ class Settings:
     first_event_timeout_seconds: float
     disconnect_grace_seconds: float
     stale_feed_timeout_seconds: float
+    stale_feed_retries: int
     shutdown_timeout_seconds: float
     flush_interval_seconds: float
     max_rows_per_file: int
@@ -323,6 +324,12 @@ class Settings:
                 "TICKRECORDER_STALE_FEED_TIMEOUT_SECONDS",
                 60.0,
                 minimum=0.0,
+            ),
+            stale_feed_retries=_env_int(
+                "TICKRECORDER_STALE_FEED_RETRIES",
+                3,
+                minimum=0,
+                maximum=20,
             ),
             shutdown_timeout_seconds=_env_float(
                 "TICKRECORDER_SHUTDOWN_TIMEOUT_SECONDS",

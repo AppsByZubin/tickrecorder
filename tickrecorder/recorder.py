@@ -137,6 +137,14 @@ class FyersTickRecorder:
                 for connection_key in self._tbt_connection_keys
             },
         }
+        self._stale_feed_retry_attempts = {
+            "data": 0,
+            **{connection_key: 0 for connection_key in self._tbt_connection_keys},
+        }
+        self._stale_feed_retry_started_at: dict[str, float | None] = {
+            connection_key: None
+            for connection_key in self._stale_feed_retry_attempts
+        }
         self._degraded_reasons: set[str] = set()
         self._streams_ready = False
         self._threads: list[threading.Thread] = []
@@ -461,6 +469,7 @@ class FyersTickRecorder:
                         self._first_symbols_seen["data"]
                     ):
                         self._first_event_events["data"].set()
+                self._record_stale_feed_recovery("data", symbol.upper())
             else:
                 self._control(
                     "data",
@@ -802,6 +811,7 @@ class FyersTickRecorder:
                     self._first_symbols_seen["tbt"]
                 ):
                     self._first_event_events["tbt"].set()
+            self._record_stale_feed_recovery("tbt", normalized_ticker)
 
             status = row["sequence_status"]
             base_status = status.removeprefix("first_after_reconnect_")
@@ -1319,18 +1329,193 @@ class FyersTickRecorder:
             },
             "missing_symbols": missing_symbols,
         }
-        exc = RuntimeError(
-            f"FYERS {component} feed stopped delivering valid callbacks"
+        affected_symbols = set(stale_symbols) | set(missing_symbols)
+        connection_symbols = self._stale_connection_symbols(
+            component,
+            affected_symbols,
         )
+        with self._state_lock:
+            exhausted = [
+                connection_key
+                for connection_key in connection_symbols
+                if self._stale_feed_retry_attempts[connection_key]
+                >= self.settings.stale_feed_retries
+            ]
+        if exhausted:
+            exc = RuntimeError(
+                f"FYERS {component} feed stopped delivering valid callbacks"
+            )
+            self._safe_control(
+                component,
+                "feed_stale",
+                {
+                    **details,
+                    "exhausted_connections": exhausted,
+                    "max_retries": self.settings.stale_feed_retries,
+                },
+                severity="ERROR",
+                message=str(exc),
+            )
+            self._set_fatal(exc, reason)
+            return True
+
+        for connection_key, symbols in connection_symbols.items():
+            self._retry_stale_connection(
+                component,
+                connection_key,
+                symbols,
+                now,
+                details,
+            )
+            if self.stop_event.is_set():
+                return True
+        return False
+
+    def _stale_connection_symbols(
+        self,
+        component: str,
+        affected_symbols: set[str],
+    ) -> dict[str, set[str]]:
+        if component == "data":
+            return {"data": set(self._configured_symbols_upper)}
+        result: dict[str, set[str]] = {}
+        for symbol in affected_symbols:
+            connection_key = self._tbt_connection_by_symbol[symbol]
+            result.setdefault(connection_key, set()).update(
+                configured.upper()
+                for configured in self._tbt_symbol_groups[
+                    self._tbt_connection_keys.index(connection_key)
+                ]
+            )
+        return result
+
+    def _retry_stale_connection(
+        self,
+        component: str,
+        connection_key: str,
+        symbols: set[str],
+        now: float,
+        stale_details: dict[str, Any],
+    ) -> None:
+        socket_object = (
+            self.data_socket
+            if component == "data"
+            else self.tbt_sockets[
+                self._tbt_connection_keys.index(connection_key)
+            ]
+        )
+        websocket_object = self._sdk_websocket(socket_object)
+        close_method = getattr(websocket_object, "close", None)
+        if not callable(close_method) or not getattr(
+            socket_object,
+            "restart_flag",
+            False,
+        ):
+            exc = RuntimeError(
+                f"FYERS {component} stale socket cannot be restarted safely; "
+                "automatic reconnect is disabled or unavailable"
+            )
+            self._safe_control(
+                component,
+                "feed_stale_retry_failure",
+                {**stale_details, "connection": connection_key},
+                severity="ERROR",
+                message=str(exc),
+                connection_key=connection_key,
+            )
+            self._set_fatal(exc, f"{component}_feed_stale_retry_failure")
+            return
+
+        with self._state_lock:
+            attempt = self._stale_feed_retry_attempts[connection_key] + 1
+            self._stale_feed_retry_attempts[connection_key] = attempt
+            self._stale_feed_retry_started_at[connection_key] = now
+            # A retry gets a full stale timeout to produce fresh callbacks.
+            # Without this baseline the health loop would repeatedly close the
+            # new socket.
+            for symbol in symbols:
+                self._last_valid_event_monotonic[component][symbol] = now
+            self._disconnected_since[connection_key] = now
         self._safe_control(
             component,
-            "feed_stale",
-            details,
-            severity="ERROR",
-            message=str(exc),
+            "feed_stale_retry",
+            {
+                **stale_details,
+                "connection": connection_key,
+                "attempt": attempt,
+                "max_retries": self.settings.stale_feed_retries,
+                "retry_observation_seconds": (
+                    self.settings.stale_feed_timeout_seconds
+                ),
+            },
+            severity="WARNING",
+            message=(
+                f"Restarting stale FYERS {component} transport "
+                f"(attempt {attempt}/{self.settings.stale_feed_retries})"
+            ),
+            connection_key=connection_key,
         )
-        self._set_fatal(exc, reason)
-        return True
+        try:
+            # Close only the underlying transport. The SDK sees an unexpected
+            # disconnect and applies its configured bounded reconnect policy;
+            # its high-level close method would disable reconnect altogether.
+            close_method()
+        except BaseException as exc:
+            self._safe_control(
+                component,
+                "feed_stale_retry_failure",
+                {
+                    "connection": connection_key,
+                    "attempt": attempt,
+                    "max_retries": self.settings.stale_feed_retries,
+                    "error": self._redact_text(exc),
+                },
+                severity="ERROR",
+                message=self._redact_text(exc),
+                connection_key=connection_key,
+            )
+            self._set_fatal(exc, f"{component}_feed_stale_retry_failure")
+
+    def _record_stale_feed_recovery(
+        self,
+        component: str,
+        symbol: str,
+    ) -> None:
+        connection_key = (
+            "data"
+            if component == "data"
+            else self._tbt_connection_by_symbol[symbol]
+        )
+        with self._state_lock:
+            retry_started_at = self._stale_feed_retry_started_at[connection_key]
+            if retry_started_at is None:
+                return
+            expected_symbols = (
+                self._configured_symbols_upper
+                if component == "data"
+                else {
+                    configured.upper()
+                    for configured in self._tbt_symbol_groups[
+                        self._tbt_connection_keys.index(connection_key)
+                    ]
+                }
+            )
+            last_events = self._last_valid_event_monotonic[component]
+            if not all(
+                last_events.get(expected, 0.0) > retry_started_at
+                for expected in expected_symbols
+            ):
+                return
+            attempt = self._stale_feed_retry_attempts[connection_key]
+            self._stale_feed_retry_attempts[connection_key] = 0
+            self._stale_feed_retry_started_at[connection_key] = None
+            self._disconnected_since[connection_key] = None
+        self._safe_control(
+            component,
+            "feed_recovered",
+            {"connection": connection_key, "attempt": attempt},
+            connection_key=connection_key,
+        )
 
     def start(self) -> None:
         LOG.info(

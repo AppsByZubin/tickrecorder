@@ -135,7 +135,8 @@ automatic retry on the next run.
 | `TICKRECORDER_REQUIRE_FIRST_EVENT` | `true` | Require one persisted SymbolUpdate and one persisted depth callback for every configured symbol before declaring the run ready. |
 | `TICKRECORDER_FIRST_EVENT_TIMEOUT_SECONDS` | `30` | Maximum post-connect wait for those first callbacks. Set the requirement to `false` only for deliberate idle-feed capture. |
 | `TICKRECORDER_DISCONNECT_GRACE_SECONDS` | `30` | Maximum continuous outage before the run fails. Any reconnect still marks the run degraded. |
-| `TICKRECORDER_STALE_FEED_TIMEOUT_SECONDS` | `60` | Fail when any configured symbol stops producing valid callbacks on either feed for this long while connected. Zero disables this check for illiquid/idle capture. |
+| `TICKRECORDER_STALE_FEED_TIMEOUT_SECONDS` | `60` | Treat a configured symbol as stale when it stops producing valid callbacks for this long while connected. Zero disables this check for illiquid/idle capture. |
+| `TICKRECORDER_STALE_FEED_RETRIES` | `3` | Restart a connected-but-stale transport this many times before failing the run. Each retry gets the full stale-feed timeout to produce fresh callbacks; zero preserves immediate failure. |
 | `TICKRECORDER_SHUTDOWN_TIMEOUT_SECONDS` | `20` | Per-phase bound for FYERS SDK, in-flight callback, and Parquet-writer shutdown. |
 
 ### Parquet output
