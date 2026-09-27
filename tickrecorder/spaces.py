@@ -26,7 +26,7 @@ DEFAULT_SPACES_PREFIX = "index-bucket-holder/contracts"
 
 
 @dataclass(frozen=True)
-class DigitalOceanSpacesConfig:
+class CloudPeS3Config:
     endpoint_url: str
     region: str
     bucket_name: str
@@ -69,7 +69,7 @@ def normalize_s3_key(bucket_name: str, key: str) -> str:
     return normalized_key
 
 
-def normalize_do_spaces_endpoint_url(
+def normalize_cloudpe_endpoint_url(
     endpoint_url: str,
     region: str,
     bucket_name: str,
@@ -84,7 +84,7 @@ def normalize_do_spaces_endpoint_url(
         endpoint_url if "://" in endpoint_url else f"https://{endpoint_url}"
     )
     parsed = urlparse(endpoint_with_scheme)
-    expected_host = f"{region}.digitaloceanspaces.com" if region else ""
+    expected_host = f"s3.{region}.purestore.io" if region else ""
     bucket_host_suffix = f".{expected_host}" if expected_host else ""
     is_regional_endpoint = bool(expected_host and parsed.netloc == expected_host)
     is_bucket_endpoint = bool(
@@ -129,6 +129,7 @@ def pending_trading_dates(
     data_dir: Path,
     bucket_name: str = DEFAULT_BUCKET_NAME,
     prefix: str = DEFAULT_SPACES_PREFIX,
+    endpoint_url: str = "https://s3.in-west2.purestore.io",
 ) -> tuple[str, ...]:
     """Return retained date directories without a valid verified-upload receipt."""
 
@@ -146,6 +147,7 @@ def pending_trading_dates(
                 path,
                 bucket_name,
                 trade_ticks_object_key(bucket_name, prefix, path.name),
+                endpoint_url,
             )
         ):
             trading_dates.append(path.name)
@@ -287,7 +289,7 @@ def trade_ticks_object_key(
 
 def upload_trade_ticks_archive(
     artifact: ArchiveArtifact,
-    spaces: DigitalOceanSpacesConfig,
+    spaces: CloudPeS3Config,
     *,
     client: Any | None = None,
 ) -> UploadReceipt:
@@ -308,13 +310,13 @@ def upload_trade_ticks_archive(
             "aws_access_key_id": spaces.access_key_id,
             "aws_secret_access_key": spaces.secret_access_key,
         }
-        if "digitaloceanspaces.com" in spaces.endpoint_url:
-            client_kwargs["config"] = Config(
-                connect_timeout=10,
-                read_timeout=60,
-                retries={"max_attempts": 5, "mode": "standard"},
-                s3={"addressing_style": "virtual"},
-            )
+        client_kwargs["config"] = Config(
+            signature_version="s3v4",
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 5, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        )
         client = boto3.client("s3", **client_kwargs)
 
     LOG.info(
@@ -340,7 +342,7 @@ def upload_trade_ticks_archive(
     remote_size = int(remote_metadata.get("ContentLength", -1))
     if remote_size != artifact.size_bytes:
         raise RuntimeError(
-            "DigitalOcean Spaces upload size mismatch "
+            "CloudPe S3 upload size mismatch "
             f"local={artifact.size_bytes} remote={remote_size}"
         )
 
@@ -349,7 +351,7 @@ def upload_trade_ticks_archive(
     )
     if metadata_sha256 != artifact.sha256:
         raise RuntimeError(
-            "DigitalOcean Spaces upload checksum metadata mismatch "
+            "CloudPe S3 upload checksum metadata mismatch "
             f"local={artifact.sha256} remote={metadata_sha256 or '<missing>'}"
         )
 
@@ -365,7 +367,7 @@ def upload_trade_ticks_archive(
     )
     remote_body = remote_object.get("Body")
     if remote_body is None:
-        raise RuntimeError("DigitalOcean Spaces read-back response has no body")
+        raise RuntimeError("CloudPe S3 read-back response has no body")
     remote_digest = hashlib.sha256()
     remote_bytes = 0
     try:
@@ -378,13 +380,13 @@ def upload_trade_ticks_archive(
             close_body()
     if remote_bytes != artifact.size_bytes:
         raise RuntimeError(
-            "DigitalOcean Spaces read-back size mismatch "
+            "CloudPe S3 read-back size mismatch "
             f"local={artifact.size_bytes} remote={remote_bytes}"
         )
     remote_sha256 = remote_digest.hexdigest()
     if remote_sha256 != artifact.sha256:
         raise RuntimeError(
-            "DigitalOcean Spaces read-back checksum mismatch "
+            "CloudPe S3 read-back checksum mismatch "
             f"local={artifact.sha256} remote={remote_sha256}"
         )
 
@@ -412,6 +414,7 @@ def _has_verified_upload_receipt(
     source_dir: Path,
     expected_bucket_name: str,
     expected_object_key: str,
+    expected_endpoint_url: str,
 ) -> bool:
     receipt_path = data_dir / "_uploads" / f"{trading_date}.json"
     try:
@@ -422,6 +425,7 @@ def _has_verified_upload_receipt(
         payload.get("trading_date") == trading_date
         and payload.get("upload_status") == "verified"
         and bool(payload.get("sha256"))
+        and payload.get("endpoint_url") == expected_endpoint_url
         and payload.get("bucket_name") == expected_bucket_name
         and payload.get("object_key") == expected_object_key
         and bool(payload.get("source_fingerprint"))

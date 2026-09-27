@@ -86,7 +86,7 @@ connections. `tickrecorder` automatically partitions the configured symbols into
 five-symbol connections, so one recorder supports up to 15 symbols. The regular
 `SymbolUpdate` socket continues to subscribe to the complete configured list.
 
-### DigitalOcean Spaces
+### CloudPe S3
 
 Every safely finalized date partition is archived during recorder shutdown. S3 upload is
 enabled by default and can be disabled while retaining the local archive.
@@ -94,12 +94,22 @@ enabled by default and can be disabled while retaining the local archive.
 | Variable | Required | Default |
 |---|---:|---|
 | `TICKRECORDER_S3_UPLOAD_ENABLED` | No | `true` |
-| `DO_S3_ENDPOINT_URL` | When upload enabled | — |
-| `DO_S3_REGION` | When upload enabled | — |
-| `DO_S3_ACCESS_KEY_ID` | When upload enabled | — |
-| `DO_S3_SECRET_ACCESS_KEY` | When upload enabled | — |
-| `DO_S3_BUCKET_NAME` | No | `index-bucket` |
-| `DO_S3_SPACES_PREFIX` | No | `index-bucket-holder/contracts` |
+| `CLOUDPE_S3_ENDPOINT_URL` | When upload enabled | — |
+| `CLOUDPE_S3_REGION` | When upload enabled | — |
+| `CLOUDPE_S3_ACCESS_KEY_ID` | When upload enabled | — |
+| `CLOUDPE_S3_SECRET_ACCESS_KEY` | When upload enabled | — |
+| `CLOUDPE_S3_BUCKET_NAME` | No | `index-bucket` |
+| `CLOUDPE_S3_PREFIX` | No | `index-bucket-holder/contracts` |
+
+Uploads and verification downloads use CloudPe S3 exclusively, with Signature V4
+and path-style bucket addressing as described in the
+[CloudPe S3 guide](https://www.cloudpe.com/knowledge-base/accessing-cloudpe-s3-buckets-using-s3cmd/).
+The Helm configuration uses `https://s3.in-west2.purestore.io` and region `in-west2`;
+the guide's `in-west3` endpoint is an example for a different region.
+Legacy `DO_S3_*` variables are no longer read; set the `CLOUDPE_S3_*` variables above.
+Receipts now include the endpoint, so retained local dates with old DigitalOcean
+receipts will be uploaded to CloudPe on the next enabled run. Remote-only archives
+are not copied automatically.
 
 Set `TICKRECORDER_S3_UPLOAD_ENABLED=false` to keep finalized `.tar.gz` archives locally
 without requiring S3 credentials or attempting an upload. A later run with uploads enabled
@@ -115,7 +125,7 @@ s3://index-bucket/index-bucket-holder/contracts/20260717/20260717_trade_ticks.ta
 The archive retains `20260717/` as its top-level directory. Upload completion is verified
 against the remote object size and by reading the stored object back and hashing its bytes
 with SHA-256 before the run can receive a success or degraded marker. Each receipt is also
-bound to the source-directory inventory and exact bucket/key, so later same-date parts or a
+bound to the source-directory inventory and exact endpoint/bucket/key, so later same-date parts or a
 destination change invalidate the old receipt. An archive or upload failure produces
 `_FAILED` and a nonzero exit, while retaining the source directory and local archive for
 automatic retry on the next run.
@@ -190,7 +200,7 @@ reports aggregate event counts and queue depth without adding per-tick I/O.
 Market timing is owned by tickrecorder, not Helm. A Job launched before 09:15 IST waits
 without opening either FYERS WebSocket. At 09:15 it connects and records into immutable
 Parquet parts. At 15:31 it requests shutdown, disconnects both sockets, drains and flushes
-the writer, creates the date archive, and uploads it to DigitalOcean Spaces when S3 upload
+the writer, creates the date archive, and uploads it to CloudPe S3 when S3 upload
 is enabled. A Job launched after 15:31 or on a weekend exits without connecting.
 
 ## Validate configuration
@@ -278,10 +288,10 @@ attention.
 - start/end times and stop reason;
 - received and written row counts;
 - every part filename, event range, byte size and SHA-256 checksum;
-- local archive metadata and, when upload is enabled, the verified DigitalOcean object key, size, SHA-256 and ETag;
+- local archive metadata and, when upload is enabled, the verified CloudPe object key, size, SHA-256 and ETag;
 - complete/degraded/failed status and degradation reasons.
 
-No FYERS token or DigitalOcean credential is written to the manifest or application logs.
+No FYERS token or CloudPe credential is written to the manifest or application logs.
 
 ## Recorded datasets
 
@@ -387,7 +397,7 @@ The offline tests verify:
 - sequence diagnostics;
 - typed Parquet round trips;
 - immutable part metadata and checksums;
-- atomic `.tar.gz` creation, optional S3 upload, exact DigitalOcean object keys and upload verification.
+- atomic `.tar.gz` creation, optional S3 upload, exact CloudPe object keys and upload verification.
 
 ## Container publishing
 

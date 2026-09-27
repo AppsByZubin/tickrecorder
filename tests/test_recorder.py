@@ -233,11 +233,11 @@ def settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
     monkeypatch.setenv("FYERS_ACCESS_TOKEN", "test-secret")
     monkeypatch.setenv("FYERS_SYMBOLS", "NSE:TEST-EQ")
     monkeypatch.setenv(
-        "DO_S3_ENDPOINT_URL", "https://sgp1.digitaloceanspaces.com"
+        "CLOUDPE_S3_ENDPOINT_URL", "https://s3.in-west2.purestore.io"
     )
-    monkeypatch.setenv("DO_S3_REGION", "sgp1")
-    monkeypatch.setenv("DO_S3_ACCESS_KEY_ID", "spaces-access-key")
-    monkeypatch.setenv("DO_S3_SECRET_ACCESS_KEY", "spaces-secret-key")
+    monkeypatch.setenv("CLOUDPE_S3_REGION", "in-west2")
+    monkeypatch.setenv("CLOUDPE_S3_ACCESS_KEY_ID", "cloudpe-access-key")
+    monkeypatch.setenv("CLOUDPE_S3_SECRET_ACCESS_KEY", "cloudpe-secret-key")
     monkeypatch.setenv("TICKRECORDER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("TICKRECORDER_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("TICKRECORDER_SDK_LOG_DIR", str(tmp_path / "sdk-logs"))
@@ -310,7 +310,7 @@ def test_recorder_writes_complete_three_stream_run(
     assert manifest["trade_tick_archives"][0]["upload_status"] == "verified"
     assert manifest["trade_tick_archives"][0]["etag"] == "test-etag"
     assert "test-secret" not in json.dumps(manifest)
-    assert "spaces-secret-key" not in json.dumps(manifest)
+    assert "cloudpe-secret-key" not in json.dumps(manifest)
 
 
 def test_tbt_symbols_are_partitioned_across_distinct_connections(
@@ -974,19 +974,19 @@ def test_control_action_is_logged_and_redacted(
         "socket_open",
         {
             "token": "APP-100:test-secret",
-            "spaces_secret": "spaces-secret-key",
+            "spaces_secret": "cloudpe-secret-key",
         },
         message=(
-            "connected with APP-100:test-secret and spaces-secret-key"
+            "connected with APP-100:test-secret and cloudpe-secret-key"
         ),
     )
 
     assert "Action component=data event=socket_open" in caplog.text
     assert "connected with <redacted> and <redacted>" in caplog.text
     assert "test-secret" not in caplog.text
-    assert "spaces-secret-key" not in caplog.text
+    assert "cloudpe-secret-key" not in caplog.text
     assert "test-secret" not in json.dumps(submitted, default=str)
-    assert "spaces-secret-key" not in json.dumps(submitted, default=str)
+    assert "cloudpe-secret-key" not in json.dumps(submitted, default=str)
 
 
 def test_stalled_valid_callback_stream_is_fatal(

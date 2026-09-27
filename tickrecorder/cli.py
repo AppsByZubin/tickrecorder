@@ -64,8 +64,8 @@ def configure_logging(settings: Settings) -> Path:
             settings.ws_token,
             settings.ws_token.split(":", 1)[-1],
             settings.app_id,
-            settings.do_s3_access_key_id,
-            settings.do_s3_secret_access_key,
+            settings.cloudpe_s3_access_key_id,
+            settings.cloudpe_s3_secret_access_key,
         },
     )
 
@@ -109,10 +109,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if settings.s3_upload_enabled:
         LOG.info(
-            "DigitalOcean upload configured destination=s3://%s/%s endpoint=%s",
-            settings.do_s3_bucket_name,
-            settings.do_s3_spaces_prefix,
-            settings.do_s3_endpoint_url,
+            "CloudPe upload configured destination=s3://%s/%s endpoint=%s",
+            settings.cloudpe_s3_bucket_name,
+            settings.cloudpe_s3_prefix,
+            settings.cloudpe_s3_endpoint_url,
         )
     else:
         LOG.info("S3 upload disabled; finalized archives will remain local")

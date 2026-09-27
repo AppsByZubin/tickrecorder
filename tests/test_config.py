@@ -14,10 +14,10 @@ FYERS_ENV_NAMES = (
 )
 
 SPACES_ENV = {
-    "DO_S3_ENDPOINT_URL": "https://sgp1.digitaloceanspaces.com",
-    "DO_S3_REGION": "sgp1",
-    "DO_S3_ACCESS_KEY_ID": "spaces-access-key",
-    "DO_S3_SECRET_ACCESS_KEY": "spaces-secret-key",
+    "CLOUDPE_S3_ENDPOINT_URL": "https://s3.in-west2.purestore.io",
+    "CLOUDPE_S3_REGION": "in-west2",
+    "CLOUDPE_S3_ACCESS_KEY_ID": "cloudpe-access-key",
+    "CLOUDPE_S3_SECRET_ACCESS_KEY": "cloudpe-secret-key",
 }
 
 
@@ -150,12 +150,12 @@ def test_redacted_settings_do_not_expose_secret(
     settings_repr = repr(settings)
     assert "APP-100" not in rendered
     assert "very-secret" not in rendered
-    assert "spaces-access-key" not in rendered
-    assert "spaces-secret-key" not in rendered
+    assert "cloudpe-access-key" not in rendered
+    assert "cloudpe-secret-key" not in rendered
     assert "APP-100" not in settings_repr
     assert "very-secret" not in settings_repr
-    assert "spaces-access-key" not in settings_repr
-    assert "spaces-secret-key" not in settings_repr
+    assert "cloudpe-access-key" not in settings_repr
+    assert "cloudpe-secret-key" not in settings_repr
     assert "<redacted>" in rendered
 
 
@@ -168,17 +168,17 @@ def test_settings_normalize_spaces_destination_and_use_defaults(
     monkeypatch.setenv("FYERS_ACCESS_TOKEN", "secret")
     monkeypatch.setenv("FYERS_SYMBOLS", "NSE:ONE-EQ")
     monkeypatch.setenv(
-        "DO_S3_ENDPOINT_URL",
-        "index-bucket.sgp1.digitaloceanspaces.com/path-is-removed",
+        "CLOUDPE_S3_ENDPOINT_URL",
+        "index-bucket.s3.in-west2.purestore.io/path-is-removed",
     )
-    monkeypatch.delenv("DO_S3_BUCKET_NAME", raising=False)
-    monkeypatch.delenv("DO_S3_SPACES_PREFIX", raising=False)
+    monkeypatch.delenv("CLOUDPE_S3_BUCKET_NAME", raising=False)
+    monkeypatch.delenv("CLOUDPE_S3_PREFIX", raising=False)
 
     settings = Settings.from_env(env_file=tmp_path / "missing.env")
 
-    assert settings.do_s3_endpoint_url == "https://sgp1.digitaloceanspaces.com"
-    assert settings.do_s3_bucket_name == "index-bucket"
-    assert settings.do_s3_spaces_prefix == "index-bucket-holder/contracts"
+    assert settings.cloudpe_s3_endpoint_url == "https://s3.in-west2.purestore.io"
+    assert settings.cloudpe_s3_bucket_name == "index-bucket"
+    assert settings.cloudpe_s3_prefix == "index-bucket-holder/contracts"
 
 
 def test_settings_require_spaces_credentials(
@@ -189,9 +189,9 @@ def test_settings_require_spaces_credentials(
     monkeypatch.setenv("FYERS_APP_ID", "APP-100")
     monkeypatch.setenv("FYERS_ACCESS_TOKEN", "secret")
     monkeypatch.setenv("FYERS_SYMBOLS", "NSE:ONE-EQ")
-    monkeypatch.delenv("DO_S3_SECRET_ACCESS_KEY")
+    monkeypatch.delenv("CLOUDPE_S3_SECRET_ACCESS_KEY")
 
-    with pytest.raises(ConfigurationError, match="DO_S3_SECRET_ACCESS_KEY"):
+    with pytest.raises(ConfigurationError, match="CLOUDPE_S3_SECRET_ACCESS_KEY"):
         Settings.from_env(env_file=tmp_path / "missing.env")
 
 
@@ -210,10 +210,10 @@ def test_settings_allow_disabled_s3_without_credentials(
     settings = Settings.from_env(env_file=tmp_path / "missing.env")
 
     assert settings.s3_upload_enabled is False
-    assert settings.do_s3_endpoint_url == ""
-    assert settings.do_s3_region == ""
-    assert settings.do_s3_access_key_id == ""
-    assert settings.do_s3_secret_access_key == ""
+    assert settings.cloudpe_s3_endpoint_url == ""
+    assert settings.cloudpe_s3_region == ""
+    assert settings.cloudpe_s3_access_key_id == ""
+    assert settings.cloudpe_s3_secret_access_key == ""
 
 
 def test_queue_timeout_must_fit_inside_shutdown_timeout(
@@ -228,4 +228,15 @@ def test_queue_timeout_must_fit_inside_shutdown_timeout(
     monkeypatch.setenv("TICKRECORDER_SHUTDOWN_TIMEOUT_SECONDS", "2")
 
     with pytest.raises(ConfigurationError, match="must be less than"):
+        Settings.from_env(env_file=tmp_path / "missing.env")
+
+
+def test_legacy_credentials_do_not_enable_cloudpe_uploads(monkeypatch, tmp_path) -> None:
+    clear_fyers_env(monkeypatch)
+    monkeypatch.setenv("FYERS_APP_ID", "APP-100")
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "secret")
+    monkeypatch.setenv("FYERS_SYMBOLS", "NSE:ONE-EQ")
+    monkeypatch.delenv("CLOUDPE_S3_SECRET_ACCESS_KEY")
+    monkeypatch.setenv("DO_S3_SECRET_ACCESS_KEY", "legacy-secret")
+    with pytest.raises(ConfigurationError, match="CLOUDPE_S3_SECRET_ACCESS_KEY"):
         Settings.from_env(env_file=tmp_path / "missing.env")

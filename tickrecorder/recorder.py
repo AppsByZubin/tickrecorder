@@ -25,7 +25,7 @@ from tickrecorder.normalizers import (
 )
 from tickrecorder.schemas import SCHEMA_VERSION
 from tickrecorder.spaces import (
-    DigitalOceanSpacesConfig,
+    CloudPeS3Config,
     create_trade_ticks_archive,
     finalized_trading_dates,
     pending_trading_dates,
@@ -204,8 +204,8 @@ class FyersTickRecorder:
             self.settings.ws_token,
             self.settings.ws_token.split(":", 1)[-1],
             self.settings.app_id,
-            self.settings.do_s3_access_key_id,
-            self.settings.do_s3_secret_access_key,
+            self.settings.cloudpe_s3_access_key_id,
+            self.settings.cloudpe_s3_secret_access_key,
         }
         for secret in sorted((item for item in secrets if item), key=len, reverse=True):
             rendered = rendered.replace(secret, "<redacted>")
@@ -1911,20 +1911,21 @@ class FyersTickRecorder:
             trading_date_set.update(
                 pending_trading_dates(
                     self.settings.data_dir,
-                    self.settings.do_s3_bucket_name,
-                    self.settings.do_s3_spaces_prefix,
+                    self.settings.cloudpe_s3_bucket_name,
+                    self.settings.cloudpe_s3_prefix,
+                    endpoint_url=self.settings.cloudpe_s3_endpoint_url,
                 )
             )
         trading_dates = tuple(sorted(trading_date_set))
         spaces = None
         if self.settings.s3_upload_enabled:
-            spaces = DigitalOceanSpacesConfig(
-                endpoint_url=self.settings.do_s3_endpoint_url,
-                region=self.settings.do_s3_region,
-                bucket_name=self.settings.do_s3_bucket_name,
-                prefix=self.settings.do_s3_spaces_prefix,
-                access_key_id=self.settings.do_s3_access_key_id,
-                secret_access_key=self.settings.do_s3_secret_access_key,
+            spaces = CloudPeS3Config(
+                endpoint_url=self.settings.cloudpe_s3_endpoint_url,
+                region=self.settings.cloudpe_s3_region,
+                bucket_name=self.settings.cloudpe_s3_bucket_name,
+                prefix=self.settings.cloudpe_s3_prefix,
+                access_key_id=self.settings.cloudpe_s3_access_key_id,
+                secret_access_key=self.settings.cloudpe_s3_secret_access_key,
             )
         LOG.info("Archiving finalized trade-tick dates dates=%s", trading_dates)
         failures: list[tuple[str, BaseException]] = []
@@ -1939,6 +1940,7 @@ class FyersTickRecorder:
                 "source_fingerprint": None,
                 "upload_status": "archiving",
                 "bucket_name": spaces.bucket_name if spaces is not None else None,
+                "endpoint_url": spaces.endpoint_url if spaces is not None else None,
                 "object_key": None,
                 "uri": None,
                 "etag": None,
@@ -2060,8 +2062,9 @@ class FyersTickRecorder:
         has_pending_uploads = self.settings.s3_upload_enabled and bool(
             pending_trading_dates(
                 self.settings.data_dir,
-                self.settings.do_s3_bucket_name,
-                self.settings.do_s3_spaces_prefix,
+                self.settings.cloudpe_s3_bucket_name,
+                self.settings.cloudpe_s3_prefix,
+                endpoint_url=self.settings.cloudpe_s3_endpoint_url,
             )
         )
         if finalized_parts or has_pending_uploads:

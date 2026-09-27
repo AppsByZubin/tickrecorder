@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from tickrecorder.spaces import (
     DEFAULT_BUCKET_NAME,
     DEFAULT_SPACES_PREFIX,
-    normalize_do_spaces_endpoint_url,
+    normalize_cloudpe_endpoint_url,
     normalize_s3_key,
 )
 
@@ -132,12 +132,12 @@ class Settings:
     log_dir: Path
     sdk_log_dir: Path
     s3_upload_enabled: bool
-    do_s3_endpoint_url: str
-    do_s3_region: str
-    do_s3_bucket_name: str
-    do_s3_spaces_prefix: str
-    do_s3_access_key_id: str = field(repr=False)
-    do_s3_secret_access_key: str = field(repr=False)
+    cloudpe_s3_endpoint_url: str
+    cloudpe_s3_region: str
+    cloudpe_s3_bucket_name: str
+    cloudpe_s3_prefix: str
+    cloudpe_s3_access_key_id: str = field(repr=False)
+    cloudpe_s3_secret_access_key: str = field(repr=False)
     tbt_channel: str
     data_reconnect: bool
     data_reconnect_retries: int
@@ -200,36 +200,36 @@ class Settings:
             "TICKRECORDER_S3_UPLOAD_ENABLED",
             True,
         )
-        do_s3_region = os.getenv("DO_S3_REGION", "").strip()
-        do_s3_bucket_name = (
-            os.getenv("DO_S3_BUCKET_NAME", "").strip() or DEFAULT_BUCKET_NAME
+        cloudpe_s3_region = os.getenv("CLOUDPE_S3_REGION", "").strip()
+        cloudpe_s3_bucket_name = (
+            os.getenv("CLOUDPE_S3_BUCKET_NAME", "").strip() or DEFAULT_BUCKET_NAME
         )
-        do_s3_endpoint_url = normalize_do_spaces_endpoint_url(
-            os.getenv("DO_S3_ENDPOINT_URL", "").strip(),
-            do_s3_region,
-            do_s3_bucket_name,
+        cloudpe_s3_endpoint_url = normalize_cloudpe_endpoint_url(
+            os.getenv("CLOUDPE_S3_ENDPOINT_URL", "").strip(),
+            cloudpe_s3_region,
+            cloudpe_s3_bucket_name,
         )
-        do_s3_spaces_prefix = normalize_s3_key(
-            do_s3_bucket_name,
-            os.getenv("DO_S3_SPACES_PREFIX", "").strip()
+        cloudpe_s3_prefix = normalize_s3_key(
+            cloudpe_s3_bucket_name,
+            os.getenv("CLOUDPE_S3_PREFIX", "").strip()
             or DEFAULT_SPACES_PREFIX,
         ).strip("/")
-        do_s3_access_key_id = os.getenv("DO_S3_ACCESS_KEY_ID", "").strip()
-        do_s3_secret_access_key = os.getenv(
-            "DO_S3_SECRET_ACCESS_KEY", ""
+        cloudpe_s3_access_key_id = os.getenv("CLOUDPE_S3_ACCESS_KEY_ID", "").strip()
+        cloudpe_s3_secret_access_key = os.getenv(
+            "CLOUDPE_S3_SECRET_ACCESS_KEY", ""
         ).strip()
         required_spaces_values = {
-            "DO_S3_ENDPOINT_URL": do_s3_endpoint_url,
-            "DO_S3_REGION": do_s3_region,
-            "DO_S3_ACCESS_KEY_ID": do_s3_access_key_id,
-            "DO_S3_SECRET_ACCESS_KEY": do_s3_secret_access_key,
+            "CLOUDPE_S3_ENDPOINT_URL": cloudpe_s3_endpoint_url,
+            "CLOUDPE_S3_REGION": cloudpe_s3_region,
+            "CLOUDPE_S3_ACCESS_KEY_ID": cloudpe_s3_access_key_id,
+            "CLOUDPE_S3_SECRET_ACCESS_KEY": cloudpe_s3_secret_access_key,
         }
         missing_spaces_values = [
             name for name, value in required_spaces_values.items() if not value
         ]
         if s3_upload_enabled and missing_spaces_values:
             raise ConfigurationError(
-                "Set required DigitalOcean Spaces variables: "
+                "Set required CloudPe S3 variables: "
                 + ", ".join(missing_spaces_values)
             )
 
@@ -280,12 +280,12 @@ class Settings:
             log_dir=resolved_path(raw_log_dir),
             sdk_log_dir=resolved_path(raw_sdk_log_dir),
             s3_upload_enabled=s3_upload_enabled,
-            do_s3_endpoint_url=do_s3_endpoint_url,
-            do_s3_region=do_s3_region,
-            do_s3_bucket_name=do_s3_bucket_name,
-            do_s3_spaces_prefix=do_s3_spaces_prefix,
-            do_s3_access_key_id=do_s3_access_key_id,
-            do_s3_secret_access_key=do_s3_secret_access_key,
+            cloudpe_s3_endpoint_url=cloudpe_s3_endpoint_url,
+            cloudpe_s3_region=cloudpe_s3_region,
+            cloudpe_s3_bucket_name=cloudpe_s3_bucket_name,
+            cloudpe_s3_prefix=cloudpe_s3_prefix,
+            cloudpe_s3_access_key_id=cloudpe_s3_access_key_id,
+            cloudpe_s3_secret_access_key=cloudpe_s3_secret_access_key,
             tbt_channel=str(channel_number),
             data_reconnect=_env_bool("TICKRECORDER_DATA_RECONNECT", True),
             data_reconnect_retries=_env_int(
@@ -375,8 +375,8 @@ class Settings:
         result = asdict(self)
         result["ws_token"] = "<redacted>"
         result["app_id"] = "<redacted>"
-        result["do_s3_access_key_id"] = "<redacted>"
-        result["do_s3_secret_access_key"] = "<redacted>"
+        result["cloudpe_s3_access_key_id"] = "<redacted>"
+        result["cloudpe_s3_secret_access_key"] = "<redacted>"
         result["symbols"] = list(self.symbols)
         for key in ("data_dir", "log_dir", "sdk_log_dir"):
             result[key] = str(result[key])

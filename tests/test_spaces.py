@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 from pathlib import Path
 from typing import Any
@@ -8,10 +9,10 @@ from typing import Any
 import pytest
 
 from tickrecorder.spaces import (
-    DigitalOceanSpacesConfig,
+    CloudPeS3Config,
     create_trade_ticks_archive,
     finalized_trading_dates,
-    normalize_do_spaces_endpoint_url,
+    normalize_cloudpe_endpoint_url,
     normalize_s3_key,
     pending_trading_dates,
     upload_trade_ticks_archive,
@@ -60,10 +61,10 @@ class FakeS3Client:
         return {"Body": io.BytesIO(body)}
 
 
-def spaces_config() -> DigitalOceanSpacesConfig:
-    return DigitalOceanSpacesConfig(
-        endpoint_url="https://sgp1.digitaloceanspaces.com",
-        region="sgp1",
+def spaces_config() -> CloudPeS3Config:
+    return CloudPeS3Config(
+        endpoint_url="https://s3.in-west2.purestore.io",
+        region="in-west2",
         bucket_name="index-bucket",
         prefix="index-bucket-holder/contracts",
         access_key_id="access-key",
@@ -142,24 +143,24 @@ def test_finalized_dates_are_unique_sorted_and_validated() -> None:
 
 def test_spaces_endpoint_and_object_key_normalization() -> None:
     assert (
-        normalize_do_spaces_endpoint_url(
-            "index-bucket.sgp1.digitaloceanspaces.com/path",
-            "sgp1",
+        normalize_cloudpe_endpoint_url(
+            "index-bucket.s3.in-west2.purestore.io/path",
+            "in-west2",
             "index-bucket",
         )
-        == "https://sgp1.digitaloceanspaces.com"
+        == "https://s3.in-west2.purestore.io"
     )
     assert (
         normalize_s3_key("index-bucket", "/index-bucket/path/to/object")
         == "path/to/object"
     )
     assert (
-        normalize_do_spaces_endpoint_url(
-            "https://sgp1.digitaloceanspaces.com/unwanted/path?query=yes",
-            "sgp1",
+        normalize_cloudpe_endpoint_url(
+            "https://s3.in-west2.purestore.io/unwanted/path?query=yes",
+            "in-west2",
             "index-bucket",
         )
-        == "https://sgp1.digitaloceanspaces.com"
+        == "https://s3.in-west2.purestore.io"
     )
 
 
@@ -177,6 +178,7 @@ def test_verified_receipt_removes_retained_date_from_pending_set(
             "sha256": artifact.sha256,
             "source_fingerprint": artifact.source_fingerprint,
             "bucket_name": "index-bucket",
+            "endpoint_url": "https://s3.in-west2.purestore.io",
             "object_key": (
                 "index-bucket-holder/contracts/20260717/"
                 "20260717_trade_ticks.tar.gz"
@@ -185,6 +187,12 @@ def test_verified_receipt_removes_retained_date_from_pending_set(
     )
 
     assert receipt_path.is_file()
+    payload = json.loads(receipt_path.read_text())
+    legacy_payload = {key: value for key, value in payload.items() if key != "endpoint_url"}
+    receipt_path.write_text(json.dumps(legacy_payload))
+    assert pending_trading_dates(tmp_path) == ("20260717",)
+    receipt_path.write_text(json.dumps(payload))
+    assert pending_trading_dates(tmp_path, endpoint_url="https://other.example") == ("20260717",)
     assert pending_trading_dates(tmp_path) == ()
     assert pending_trading_dates(tmp_path, prefix="different/contracts") == (
         "20260717",
@@ -250,7 +258,7 @@ def test_upload_rejects_same_size_checksum_mismatch(tmp_path: Path) -> None:
         )
 
 
-def test_upload_builds_digitalocean_virtual_host_client(
+def test_upload_builds_cloudpe_path_style_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -268,13 +276,14 @@ def test_upload_builds_digitalocean_virtual_host_client(
 
     upload_trade_ticks_archive(artifact, spaces_config())
 
-    assert captured_kwargs["region_name"] == "sgp1"
+    assert captured_kwargs["region_name"] == "in-west2"
     assert captured_kwargs["endpoint_url"] == (
-        "https://sgp1.digitaloceanspaces.com"
+        "https://s3.in-west2.purestore.io"
     )
     assert captured_kwargs["aws_access_key_id"] == "access-key"
     assert captured_kwargs["aws_secret_access_key"] == "secret-key"
-    assert captured_kwargs["config"].s3 == {"addressing_style": "virtual"}
+    assert captured_kwargs["config"].s3 == {"addressing_style": "path"}
+    assert captured_kwargs["config"].signature_version == "s3v4"
     assert captured_kwargs["config"].connect_timeout == 10
     assert captured_kwargs["config"].read_timeout == 60
 
