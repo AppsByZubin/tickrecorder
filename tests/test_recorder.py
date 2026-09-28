@@ -122,6 +122,7 @@ class FakeSpacesClient:
         bucket: str,
         key: str,
         ExtraArgs: dict[str, Any],
+        Config: Any,
     ) -> None:
         path = Path(local_path)
         self.uploads.append((path, bucket, key))

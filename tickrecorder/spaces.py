@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 from tickrecorder.logger import create_logger
@@ -334,6 +335,9 @@ def upload_trade_ticks_archive(
             "ContentType": "application/gzip",
             "Metadata": {"sha256": artifact.sha256},
         },
+        # Match the recovery scripts: CloudPe can reject UploadPart requests.
+        # Keep archives below 5 GiB on the single-request PutObject path.
+        Config=TransferConfig(multipart_threshold=5 * 1024 * 1024 * 1024),
     )
     remote_metadata = client.head_object(
         Bucket=spaces.bucket_name,

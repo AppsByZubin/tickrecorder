@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tarfile
 from pathlib import Path
 from typing import Any
 
+import boto3
+from botocore.stub import Stubber
 import pytest
 
 from tickrecorder.spaces import (
@@ -38,6 +41,7 @@ class FakeS3Client:
         bucket: str,
         key: str,
         ExtraArgs: dict[str, Any],
+        Config: Any,
     ) -> None:
         path = Path(local_path)
         self.uploads.append((path, bucket, key))
@@ -292,3 +296,33 @@ def test_spaces_config_repr_does_not_expose_credentials() -> None:
     rendered = repr(spaces_config())
     assert "access-key" not in rendered
     assert "secret-key" not in rendered
+
+
+def test_upload_over_8_mib_uses_put_object_and_verifies_readback(tmp_path: Path) -> None:
+    date_dir = create_date_tree(tmp_path)
+    (date_dir / "symbolupdate" / "large.parquet").write_bytes(os.urandom(9 * 1024 * 1024))
+    artifact = create_trade_ticks_archive(tmp_path, "20260717")
+    assert artifact.size_bytes > 8 * 1024 * 1024
+    client = boto3.client(
+        "s3",
+        region_name="in-west2",
+        endpoint_url="https://example.invalid",
+        aws_access_key_id="test-key",
+        aws_secret_access_key="test-secret",
+    )
+    with Stubber(client) as stub:
+        # The real transfer manager must choose PutObject. Any multipart request
+        # fails this stub, reproducing the operation denied by CloudPe.
+        stub.add_response("put_object", {"ETag": '"test-etag"'})
+        stub.add_response("head_object", {
+            "ContentLength": artifact.size_bytes,
+            "Metadata": {"sha256": artifact.sha256},
+            "ETag": '"test-etag"',
+        })
+        stub.add_response("get_object", {
+            "Body": io.BytesIO(artifact.archive_path.read_bytes()),
+        })
+        receipt = upload_trade_ticks_archive(artifact, spaces_config(), client=client)
+        stub.assert_no_pending_responses()
+    assert receipt.size_bytes == artifact.size_bytes
+    assert receipt.sha256 == artifact.sha256

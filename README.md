@@ -122,13 +122,51 @@ data/20260717_trade_ticks.tar.gz
 s3://index-bucket/index-bucket-holder/contracts/20260717/20260717_trade_ticks.tar.gz
 ```
 
-The archive retains `20260717/` as its top-level directory. Upload completion is verified
+The archive retains `20260717/` as its top-level directory. Archives below 5 GiB
+use a single `PutObject` request, matching the recovery script; archives at or above
+5 GiB still require working multipart upload permissions/support on CloudPe.
+Upload completion is verified
 against the remote object size and by reading the stored object back and hashing its bytes
 with SHA-256 before the run can receive a success or degraded marker. Each receipt is also
 bound to the source-directory inventory and exact endpoint/bucket/key, so later same-date parts or a
 destination change invalidate the old receipt. An archive or upload failure produces
 `_FAILED` and a nonzero exit, while retaining the source directory and local archive for
 automatic retry on the next run.
+
+### Recover a date from Kubernetes storage
+
+Use the standalone Bash recovery script when the normal shutdown upload did not finish:
+
+```bash
+# Preview recovery and the destination without uploading.
+DRY_RUN=true scripts/recover_pv_to_cloudpe_s3.sh 20260928
+
+# Recover and upload the date (defaults to today in Asia/Kolkata when omitted).
+scripts/recover_pv_to_cloudpe_s3.sh 20260928
+```
+
+The script uses namespace `botspace`, PVC `tickrecorder-data`, and the running
+`tickrecorder` pod, falling back to a temporary pod mounting the PVC read-only.
+It uploads `YYYYMMDD_trade_ticks.tar.gz` to the same CloudPe key as the recorder,
+then verifies size and SHA-256 by reading the object back. Archives below 5 GiB
+use a single upload, matching the taperecorder recovery script and avoiding
+CloudPe `UploadPart` failures. Larger archives still require working multipart
+permissions/support. Existing objects at that
+key are overwritten. Only the requested date is recovered; `_runs` and `_uploads`
+are excluded. No upload receipt or run marker is written back to the PVC.
+
+Credentials come from the current `CLOUDPE_S3_*` environment, then an optional
+`CREDS_FILE` (trusted shell file), optional `HELM_VALUES_FILE`, then the live Job/Pod
+configuration, including Secret/ConfigMap references. Requires Bash, `kubectl`,
+Python 3, and `tar`; installs `boto3` locally under `/tmp` if needed for an upload.
+
+Run after recording has stopped for a complete date. A date directory is rebuilt
+into an archive; an existing archive is reused only when the directory is absent.
+Unfinished `.inprogress` files cause failure by default; `STRICT=false` skips them
+when rebuilding for partial recovery. Local staging is retained in the printed
+`WORK_DIR`; supply a fresh directory for each invocation. `DRY_RUN=true` still reads
+Kubernetes data and may create and delete a helper pod. Use `--help` for namespace,
+PVC, data-path, credential, and helper-image overrides.
 
 ## Optional environment variables
 
